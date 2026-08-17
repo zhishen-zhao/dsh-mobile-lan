@@ -10,6 +10,8 @@ export interface MobileRemoteConfig {
 	allowInlineAccessToken?: boolean;
 	/** Public HTTPS origin the Android app should use after scanning a local QR code. */
 	pairingServerUrl?: string;
+	/** JSON state file read whenever the localhost pairing page is refreshed. */
+	pairingServerUrlFile?: string;
 	/** Lifetime of the one-time QR pairing code, from 60 seconds to 15 minutes. */
 	localPairingQrTtlMs?: number;
 	title?: string;

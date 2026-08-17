@@ -12,7 +12,7 @@
 #   - id: mobile-remote
 #     config:
 #       accessTokenEnv: DSH_MOBILE_PAIRING_TOKEN
-#       pairingServerUrl: https://192.168.1.10:3080
+#       pairingServerUrlFile: C:/Users/you/.dsh/mobile-endpoint.json
 #       sshAliases: [dev]         # 显式手机 SSH 范围;留空会禁用手机 SSH
 #
 # Requires the host-plane `webServer` and `apiProxy` services (present in the
@@ -27,6 +27,7 @@
         accessTokenEnv: ''
         allowInlineAccessToken: false
         pairingServerUrl: ''
+        pairingServerUrlFile: ''
         localPairingQrTtlMs: 300000
         title: 'DSH 远程控制'
         sshAliases: []

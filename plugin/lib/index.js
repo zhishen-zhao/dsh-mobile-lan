@@ -31,6 +31,8 @@ const Config = z.object({
 	allowInlineAccessToken: z.boolean().default(false),
 	/** HTTPS origin embedded in a QR code rendered only at localhost/mobile-pair. */
 	pairingServerUrl: z.string().default(""),
+	/** Optional JSON state file read on every pairing-page request. */
+	pairingServerUrlFile: z.string().default(""),
 	localPairingQrTtlMs: z.natural().min(60000).max(900000).default(300000),
 	title: z.string().default("DSH 远程控制"),
 	/** Explicit SSH aliases exposed to the phone. An empty list disables mobile SSH. */
@@ -64,6 +66,17 @@ const MIME = {
 
 const sha256 = (text) => createHash("sha256").update(String(text), "utf8").digest("hex");
 const escapeHtml = (text) => String(text).replace(/[&<>"']/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[character]);
+
+function parsePairingServerOrigin(value, source) {
+	try {
+		if (typeof value !== "string" || value.trim().length === 0) throw new Error();
+		const parsed = new URL(value.trim());
+		if (parsed.protocol !== "https:" || parsed.hostname.length === 0 || parsed.username.length > 0 || parsed.password.length > 0 || parsed.search.length > 0 || parsed.hash.length > 0 || (parsed.pathname !== "" && parsed.pathname !== "/")) throw new Error();
+		return parsed.origin;
+	} catch {
+		throw new Error(`mobile-remote: ${source} must be an HTTPS origin without a path, query, fragment, or credentials`);
+	}
+}
 
 const SECURITY_HEADERS = {
 	"x-content-type-options": "nosniff",
@@ -159,16 +172,31 @@ function apply(ctx, config = {}) {
 	const configuredAliases = Array.isArray(config.sshAliases) ? config.sshAliases.filter((alias) => typeof alias === "string" && alias.trim().length > 0).map((alias) => alias.trim()) : [];
 	if (new Set(configuredAliases).size !== configuredAliases.length) throw new Error("mobile-remote: sshAliases must not contain duplicates");
 	if (new Set(configuredWorkspaceIds).size !== configuredWorkspaceIds.length) throw new Error("mobile-remote: workspaceIds must not contain duplicates");
-	let pairingServerUrl;
+	let configuredPairingServerUrl;
 	if (typeof config.pairingServerUrl === "string" && config.pairingServerUrl.trim().length > 0) {
-		try {
-			const parsed = new URL(config.pairingServerUrl.trim());
-			if (parsed.protocol !== "https:" || parsed.hostname.length === 0 || parsed.username.length > 0 || parsed.password.length > 0 || parsed.search.length > 0 || parsed.hash.length > 0 || (parsed.pathname !== "" && parsed.pathname !== "/")) throw new Error();
-			pairingServerUrl = parsed.origin;
-		} catch {
-			throw new Error("mobile-remote: pairingServerUrl must be an HTTPS origin without a path, query, fragment, or credentials");
-		}
+		configuredPairingServerUrl = parsePairingServerOrigin(config.pairingServerUrl, "pairingServerUrl");
 	}
+	const pairingServerUrlFile = typeof config.pairingServerUrlFile === "string" && config.pairingServerUrlFile.trim().length > 0 ? config.pairingServerUrlFile.trim() : void 0;
+	if (pairingServerUrlFile?.includes("\0")) throw new Error("mobile-remote: pairingServerUrlFile contains an invalid null character");
+	const resolvePairingServerUrl = () => {
+		if (pairingServerUrlFile === void 0) return configuredPairingServerUrl;
+		let bytes;
+		try {
+			bytes = readFileSync(pairingServerUrlFile);
+		} catch (error) {
+			if (error?.code === "ENOENT" && configuredPairingServerUrl !== void 0) return configuredPairingServerUrl;
+			throw new Error(`mobile-remote: cannot read pairingServerUrlFile: ${error instanceof Error ? error.message : String(error)}`);
+		}
+		if (bytes.length > 4096) throw new Error("mobile-remote: pairingServerUrlFile exceeds 4096 bytes");
+		let state;
+		try {
+			state = JSON.parse(bytes.toString("utf8"));
+		} catch {
+			throw new Error("mobile-remote: pairingServerUrlFile is not valid JSON");
+		}
+		if (state === null || typeof state !== "object" || Array.isArray(state)) throw new Error("mobile-remote: pairingServerUrlFile must contain a JSON object");
+		return parsePairingServerOrigin(state.pairingServerUrl, "pairingServerUrlFile.pairingServerUrl");
+	};
 	const distDir = fileURLToPath(new URL("../dist/", import.meta.url));
 
 	const tokenDigest = sha256(token);
@@ -306,9 +334,16 @@ function apply(ctx, config = {}) {
 	const serveLocalPairingQr = async (req, res) => {
 		// The long-lived root token is never rendered. This page exists only on
 		// the desktop loopback origin and creates a short-lived, single-use code.
-		if (!isLoopbackRequest(req) || token.length === 0 || pairingServerUrl === void 0) {
+		if (!isLoopbackRequest(req) || token.length === 0) {
 			return sendJson(res, 404, { ok: false, error: "not found" });
 		}
+		let pairingServerUrl;
+		try {
+			pairingServerUrl = resolvePairingServerUrl();
+		} catch (error) {
+			return sendJson(res, 503, { ok: false, error: error instanceof Error ? error.message : String(error), hint: "局域网端点尚未就绪；请启动 scripts/start-mobile-lan.ps1 后刷新本页。" });
+		}
+		if (pairingServerUrl === void 0) return sendJson(res, 503, { ok: false, error: "mobile pairing server URL is not configured", hint: "请配置 pairingServerUrlFile 或 pairingServerUrl。" });
 		const oneTimeToken = issueLocalPairingCode();
 		const pairingUri = `dshmobile://pair?server=${encodeURIComponent(pairingServerUrl)}&token=${encodeURIComponent(oneTimeToken)}`;
 		const svg = await QRCode.toString(pairingUri, { type: "svg", errorCorrectionLevel: "M", margin: 2 });

@@ -29,6 +29,8 @@ $env:DSH_MOBILE_PAIRING_TOKEN = [Convert]::ToBase64String($bytes)
   config:
     accessTokenEnv: DSH_MOBILE_PAIRING_TOKEN
     title: 'DSH Remote'
+    pairingServerUrlFile: 'C:/Users/your-name/.dsh/mobile-endpoint.json'
+    pairingServerUrl: ''          # optional static HTTPS fallback
     sshAliases: [dev]             # explicit mobile scope; [] disables mobile SSH
     allowExistingSessions: false  # mobile-created sessions only
     maxHistoryMessages: 80
@@ -42,7 +44,7 @@ Restart `dsh web` after changing configuration. The legacy inline `accessToken` 
 
 ## HTTPS phone access
 
-Keep `dsh web` on its default loopback binding. Obtain a certificate trusted by the phone whose SAN contains the IP/DNS name the phone uses. Then run:
+Keep `dsh web` on its default loopback binding. For a complete installation, use `.\scripts\start-mobile-lan.ps1` from the repository root. It starts Harness when needed, reuses the stable CA to issue a leaf certificate for the current physical LAN IPv4, restarts the proxy, and updates the endpoint file atomically. The manual equivalent is:
 
 ```powershell
 dsh web

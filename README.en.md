@@ -47,11 +47,12 @@ Read [the repository security policy](SECURITY.md), [the mobile plugin threat mo
 
 | Path | Purpose |
 | --- | --- |
-| `plugin/` | `dsh-mobile-remote` Cordis plugin, PWA, TLS proxy, and 38 smoke tests. |
+| `plugin/` | `dsh-mobile-remote` Cordis plugin, PWA, TLS proxy, and 41 smoke tests. |
 | `android/` | Android 1.6 QR launcher and restricted WebView client. |
 | `optional/dsh-tool-ssh/` | Optional SSH tool and 21 loopback SSH tests. |
 | `docs/branding/` | App icon source, generated master, and launcher-mask preview. |
-| `scripts/setup-local-tls.ps1` | Generates a CA, server identity, and Android trust anchor for one installation. |
+| `scripts/setup-local-tls.ps1` | Creates the CA once, then reuses it while refreshing the current server identity. |
+| `scripts/start-mobile-lan.ps1` | Starts/monitors Harness and the TLS proxy and follows the physical LAN IPv4. |
 | `scripts/generate-app-icons.py` | Regenerates the Android and PWA icon sets from the source artwork. |
 | `scripts/verify.ps1` | Runs the JavaScript, dependency, SSH, Android, and lint checks. |
 
@@ -114,7 +115,7 @@ The script creates:
 
 All of these generated paths are excluded by `.gitignore`. **Every installation must generate its own CA.** This repository intentionally does not publish a universal APK: a universal build would either trust the wrong CA or weaken TLS verification.
 
-Changing the LAN IP/DNS name or regenerating the CA requires generating a matching certificate and rebuilding/reinstalling the Android app.
+The script reuses an existing CA by default. A LAN IP change only refreshes the leaf server certificate and does not require reinstalling the app. Only the explicit `-RotateCa` option replaces the CA; after that operation, rebuild and reinstall the Android app.
 
 ### 4. Install and configure the mobile plugin
 
@@ -131,7 +132,11 @@ Add the profile override to `$DSH_HOME/profiles/web/cordis.patch.yml`:
   config:
     accessTokenEnv: DSH_MOBILE_PAIRING_TOKEN
     title: 'DSH Remote'
-    pairingServerUrl: 'https://192.168.1.10:3080'
+    # Atomically updated by the watcher and reread on every pairing-page refresh.
+    pairingServerUrlFile: 'C:/Users/your-name/.dsh/mobile-endpoint.json'
+
+    # Optional static fallback; leave empty for the normal auto-follow mode.
+    pairingServerUrl: ''
     localPairingQrTtlMs: 300000
 
     # Safer default: show only sessions created through the phone API.
@@ -151,20 +156,20 @@ Add the profile override to `$DSH_HOME/profiles/web/cordis.patch.yml`:
     requireSecureTransport: true
 ```
 
-### 5. Start Harness and the TLS LAN proxy
+### 5. Start Harness and the auto-following TLS LAN proxy
 
-Terminal one:
+The recommended single command is:
 
 ```powershell
-dsh web
+.\scripts\start-mobile-lan.ps1
 ```
 
-Terminal two:
+The script starts `dsh web` if necessary, chooses a physical WLAN/Ethernet adapter with a default gateway, and excludes VPN, tunnel, and virtual adapters. When the address changes, it reuses the CA, refreshes the leaf certificate, restarts the address-bound proxy, and atomically updates `$HOME/.dsh/mobile-endpoint.json`. Refresh `http://127.0.0.1:3080/mobile-pair` to obtain the current address.
+
+If another process already manages Harness, run:
 
 ```powershell
-node .\plugin\scripts\lan-proxy.mjs 3080 192.168.1.10 3080 `
-  --tls-cert .\certs\server-cert.pem `
-  --tls-key .\certs\server-key.pem
+.\scripts\start-mobile-lan.ps1 -DoNotStartHarness
 ```
 
 If Windows Firewall prompts, allow Node.js only on trusted **private** networks.
@@ -192,6 +197,7 @@ You can also open `android/` in Android Studio and press Run.
 1. On the computer itself, open `http://127.0.0.1:3080/mobile-pair`.
 2. In the Android app, grant camera permission and scan the QR code.
 3. The app exchanges the single-use code for an HttpOnly device session, then opens the restricted mobile UI.
+4. After an IP change, wait for the watcher to report `Ready`, refresh the pairing page, and scan again. Reinstalling is needed only after replacing the CA.
 
 ## Optional SSH support
 
@@ -212,6 +218,7 @@ Avoid `allowUnrestrictedCommands` unless you explicitly accept arbitrary shell e
 | --- | --- | --- |
 | `accessTokenEnv` | unset | Must name an environment variable containing at least 32 random bytes. |
 | `pairingServerUrl` | unset | Exact HTTPS origin used by the phone; the certificate SAN must match. |
+| `pairingServerUrlFile` | unset | Dynamic HTTPS endpoint state, read on every pairing-page refresh before the static fallback. |
 | `allowExistingSessions` | `false` | `true` exposes existing desktop sessions to the paired phone. |
 | `workspaceIds` | `[]` | Empty allows all registered workspaces; explicit IDs narrow the scope. |
 | `sshAliases` | `[]` | Empty disables mobile SSH in both UI and server authorization. |
@@ -222,8 +229,9 @@ Avoid `allowUnrestrictedCommands` unless you explicitly accept arbitrary shell e
 
 ### TLS validation fails after pairing
 
-- Ensure `pairingServerUrl` exactly matches the certificate SAN.
-- If the IP changed, rerun the TLS script, rebuild, and reinstall the app.
+- Confirm that `scripts/start-mobile-lan.ps1` is running and has printed `Ready` for the current address.
+- Refresh the pairing page and confirm the address under the QR matches the physical LAN IPv4.
+- An IP change does not require reinstalling the app. Rebuild and reinstall only after intentionally rotating the CA.
 - Never ignore WebView certificate errors or downgrade the proxy to HTTP.
 
 ### The phone cannot reach the computer
@@ -248,7 +256,7 @@ $env:Path = "$env:JAVA_HOME\bin;$env:Path"
 
 Current verified baseline:
 
-- `dsh-mobile-remote 0.7.3`: 38 smoke checks.
+- `dsh-mobile-remote 0.8.0`: 41 smoke checks.
 - `dsh-tool-ssh 0.2.0`: 21 loopback SSH checks.
 - Production npm dependency audits: zero known vulnerabilities.
 - Android: `testDebugUnitTest`, `lintDebug`, and `assembleDebug` pass.

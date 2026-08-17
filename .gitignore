@@ -16,6 +16,7 @@ certs/
 android/app/src/main/res/raw/dsh_mobile_local_ca.pem
 
 # Local artifacts
+.tmp-*/
 *.apk
 *.aab
 *.jks

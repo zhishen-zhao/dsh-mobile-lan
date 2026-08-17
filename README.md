@@ -47,11 +47,12 @@ flowchart LR
 
 | 路径 | 内容 |
 | --- | --- |
-| `plugin/` | `dsh-mobile-remote` Cordis 插件、PWA、TLS 代理和 38 项 smoke 测试。 |
+| `plugin/` | `dsh-mobile-remote` Cordis 插件、PWA、TLS 代理和 41 项 smoke 测试。 |
 | `android/` | Android 1.6 原生扫码启动器和受限 WebView。 |
 | `optional/dsh-tool-ssh/` | 可选 SSH 工具插件及 21 项回环 SSH 测试。 |
 | `docs/branding/` | App 图标源文件、生成结果与圆形/自适应遮罩预览。 |
-| `scripts/setup-local-tls.ps1` | 为当前安装生成 CA、服务证书、私钥并注入 Android 资源。 |
+| `scripts/setup-local-tls.ps1` | 首次生成 CA；以后复用 CA，仅为当前地址重签服务证书。 |
+| `scripts/start-mobile-lan.ps1` | 启动/监控 Harness 和 TLS 代理，跟随物理局域网 IPv4。 |
 | `scripts/generate-app-icons.py` | 从图标源文件重新生成 Android 与 PWA 全套尺寸。 |
 | `scripts/verify.ps1` | 运行插件、SSH 和 Android 的完整验证。 |
 
@@ -114,6 +115,8 @@ Get-NetIPAddress -AddressFamily IPv4 |
 
 以上路径均被 `.gitignore` 排除。每位使用者必须生成自己的证书；因此仓库不提供通用 APK。
 
+此脚本默认会复用已经存在的 CA。以后电脑内网 IP 变化时，只会重新签发服务证书，App 不需要重装。只有明确执行 `-RotateCa` 才会更换 CA；更换后必须重新构建并覆盖安装 App。
+
 ### 4. 安装移动插件
 
 在仓库根目录运行：
@@ -129,7 +132,11 @@ dsh plugin --profile web add link:.\plugin
   config:
     accessTokenEnv: DSH_MOBILE_PAIRING_TOKEN
     title: 'DSH 远程控制'
-    pairingServerUrl: 'https://192.168.1.10:3080'
+    # 启动脚本会原子更新此文件；每次刷新配对页都会重新读取。
+    pairingServerUrlFile: 'C:/Users/你的用户名/.dsh/mobile-endpoint.json'
+
+    # 可选静态回退；正常自动跟随模式可留空。
+    pairingServerUrl: ''
     localPairingQrTtlMs: 300000
 
     # 默认只允许手机创建的会话；需要同步桌面任务时才改为 true。
@@ -149,20 +156,20 @@ dsh plugin --profile web add link:.\plugin
     requireSecureTransport: true
 ```
 
-### 5. 启动 Harness 和局域网 TLS 代理
+### 5. 启动 Harness 和自动跟随的局域网 TLS 代理
 
-终端一：
+推荐只运行一个命令：
 
 ```powershell
-dsh web
+.\scripts\start-mobile-lan.ps1
 ```
 
-终端二：
+脚本会在需要时启动 `dsh web`，优先选择带默认网关的物理 WLAN/以太网，并排除 VPN、隧道和虚拟网卡。地址改变后，它会复用 CA 重签服务证书、重启仅绑定该地址的 TLS 代理，再原子更新 `$HOME/.dsh/mobile-endpoint.json`。刷新 `http://127.0.0.1:3080/mobile-pair` 即可得到最新地址。
+
+若 Harness 已由其他程序管理，可运行：
 
 ```powershell
-node .\plugin\scripts\lan-proxy.mjs 3080 192.168.1.10 3080 `
-  --tls-cert .\certs\server-cert.pem `
-  --tls-key .\certs\server-key.pem
+.\scripts\start-mobile-lan.ps1 -DoNotStartHarness
 ```
 
 Windows 防火墙询问时，只允许受信任的“专用网络”。
@@ -190,7 +197,7 @@ cd ..
 1. 在电脑本机浏览器打开 `http://127.0.0.1:3080/mobile-pair`。
 2. 打开 Android App，允许相机权限并扫描二维码。
 3. App 先用一次性码换取设备 Cookie，再加载受限移动页面。
-4. 如更换电脑 IP、DNS 名或重新生成 CA，需要重新构建并覆盖安装 App。
+4. IP 改变后等待启动脚本显示 `Ready`，刷新配对页再扫码即可；只有 CA 被替换时才需要重装 App。
 
 ## 可选：启用 SSH
 
@@ -211,6 +218,7 @@ SSH 插件默认禁用且没有主机。请按其[中文说明](optional/dsh-too
 | --- | --- | --- |
 | `accessTokenEnv` | 无 | 必须指向至少 32 字节随机密钥的环境变量。 |
 | `pairingServerUrl` | 无 | 手机实际访问的 HTTPS 根地址，证书 SAN 必须匹配。 |
+| `pairingServerUrlFile` | 无 | 动态 HTTPS 地址状态文件；刷新配对页时读取，优先于静态地址。 |
 | `allowExistingSessions` | `false` | `true` 会让手机看到桌面现有任务。 |
 | `workspaceIds` | `[]` | 空数组允许选择全部 Harness 工作区；填写 ID 可进一步限制。 |
 | `sshAliases` | `[]` | 空数组同时在界面和服务端禁用手机 SSH。 |
@@ -221,8 +229,9 @@ SSH 插件默认禁用且没有主机。请按其[中文说明](optional/dsh-too
 
 ### 配对后提示 TLS 失败
 
-- 确认 `pairingServerUrl` 与证书 SAN 完全相同。
-- IP 改变后重新运行 TLS 脚本、重新构建并覆盖安装 App。
+- 确认 `scripts/start-mobile-lan.ps1` 正在运行并已显示当前地址的 `Ready`。
+- 刷新配对页，确认二维码下方地址与电脑当前物理局域网 IPv4 相同。
+- IP 改变不需要重装 App；若明确轮换了 CA，才重新构建并覆盖安装。
 - 不要在 WebView 中忽略证书错误，也不要把代理降级为 HTTP。
 
 ### 手机无法连接电脑
@@ -253,7 +262,7 @@ $env:Path = "$env:JAVA_HOME\bin;$env:Path"
 
 当前基线：
 
-- `dsh-mobile-remote 0.7.3`：38 项 smoke 测试。
+- `dsh-mobile-remote 0.8.0`：41 项 smoke 测试。
 - `dsh-tool-ssh 0.2.0`：21 项回环 SSH 测试。
 - 两个 npm 生产依赖审计：0 个已知漏洞。
 - Android：`testDebugUnitTest`、`lintDebug`、`assembleDebug`。

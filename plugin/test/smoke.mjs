@@ -11,6 +11,9 @@
  */
 import assert from "node:assert/strict";
 import http from "node:http";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Context } from "@deepseek-ai/cordis";
 import * as plugin from "../lib/index.js";
 import { isAllowedProxyRequest, makeUpstreamHeaders } from "../scripts/lan-proxy-policy.mjs";
@@ -207,13 +210,18 @@ const requestWithHost = (port, path, host) => new Promise((resolvePromise, rejec
 });
 
 const openServers = [];
+const tempRoots = [];
 async function main() {
 	const listen = (bundle) => new Promise((resolvePromise) => {
 		const server = makeServer(bundle);
 		openServers.push(server);
 		server.listen(0, "127.0.0.1", () => resolvePromise(server));
 	});
-	const bundle = makeContext({ accessToken: "0123456789abcdef0123456789abcdef", allowInlineAccessToken: true, requireSecureTransport: false, title: "测试遥控", pairingServerUrl: "https://192.168.1.10:3080", sshAliases: ["dev"], workspaceId: "w1", workspaceIds: ["w1"], maxHistoryMessages: 80 });
+	const endpointRoot = mkdtempSync(join(tmpdir(), "dsh-mobile-endpoint-"));
+	tempRoots.push(endpointRoot);
+	const endpointFile = join(endpointRoot, "endpoint.json");
+	writeFileSync(endpointFile, JSON.stringify({ schemaVersion: 1, pairingServerUrl: "https://192.168.1.10:3080" }));
+	const bundle = makeContext({ accessToken: "0123456789abcdef0123456789abcdef", allowInlineAccessToken: true, requireSecureTransport: false, title: "测试遥控", pairingServerUrl: "https://192.168.1.9:3080", pairingServerUrlFile: endpointFile, sshAliases: ["dev"], workspaceId: "w1", workspaceIds: ["w1"], maxHistoryMessages: 80 });
 	const ctx = bundle.ctx;
 	const server = await listen(bundle);
 	const port = server.address().port;
@@ -294,8 +302,35 @@ async function main() {
 		assert.match(page.headers.get("content-type"), /text\/html/);
 		assert.equal(page.headers.get("cache-control"), "no-store");
 		assert.match(page.text, /<svg/);
+		assert.match(page.text, /https:\/\/192\.168\.1\.10:3080/);
 		assert.doesNotMatch(page.text, /0123456789abcdef0123456789abcdef/);
 		ok("localhost pairing page renders a one-time QR without the root secret");
+	}
+	{
+		writeFileSync(endpointFile, JSON.stringify({ schemaVersion: 1, pairingServerUrl: "https://192.168.1.11:3080", updatedAt: new Date().toISOString() }));
+		const refreshed = await request(server, port, "/mobile-pair");
+		assert.equal(refreshed.status, 200);
+		assert.match(refreshed.text, /https:\/\/192\.168\.1\.11:3080/);
+		assert.doesNotMatch(refreshed.text, /https:\/\/192\.168\.1\.10:3080/);
+		ok("pairing page refresh reads the current LAN endpoint from disk");
+	}
+	{
+		for (const badValue of ["http://192.168.1.11:3080", "https://user:pass@192.168.1.11:3080", "https://192.168.1.11:3080/mobile", "https://192.168.1.11:3080?token=x"]) {
+			writeFileSync(endpointFile, JSON.stringify({ pairingServerUrl: badValue }));
+			const rejected = await request(server, port, "/mobile-pair");
+			assert.equal(rejected.status, 503);
+		}
+		writeFileSync(endpointFile, "{broken");
+		const corrupted = await request(server, port, "/mobile-pair");
+		assert.equal(corrupted.status, 503);
+		ok("dynamic endpoint rejects HTTP, credentials, paths, queries, and corrupt JSON");
+	}
+	{
+		rmSync(endpointFile);
+		const fallback = await request(server, port, "/mobile-pair");
+		assert.equal(fallback.status, 200);
+		assert.match(fallback.text, /https:\/\/192\.168\.1\.9:3080/);
+		ok("missing endpoint state safely falls back to the configured HTTPS origin");
 	}
 	{
 		const blocked = await requestWithHost(port, "/mobile-pair", "192.168.1.10:3080");
@@ -516,11 +551,13 @@ async function main() {
 
 	await ctx.fiber.dispose();
 	for (const openServer of openServers) await new Promise((resolvePromise) => openServer.close(resolvePromise));
+	for (const root of tempRoots) rmSync(root, { recursive: true, force: true });
 	console.log(`\nall ${passed} checks passed`);
 }
 
 main().catch(async (error) => {
 	console.error(error);
 	for (const openServer of openServers) await new Promise((resolvePromise) => openServer.close(resolvePromise));
+	for (const root of tempRoots) rmSync(root, { recursive: true, force: true });
 	process.exitCode = 1;
 });

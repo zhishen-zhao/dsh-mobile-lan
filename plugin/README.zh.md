@@ -41,8 +41,10 @@ $env:DSH_MOBILE_PAIRING_TOKEN = [Convert]::ToBase64String($bytes)
   config:
     accessTokenEnv: DSH_MOBILE_PAIRING_TOKEN
     title: 'DSH 遥控'
-    # 手机实际访问的 TLS 地址；用于生成本机二维码，必须是 HTTPS 根地址。
-    pairingServerUrl: 'https://192.168.1.10:3080'
+    # 根目录启动脚本动态写入；每次刷新本机配对页都会重读。
+    pairingServerUrlFile: 'C:/Users/你的用户名/.dsh/mobile-endpoint.json'
+    # 可选 HTTPS 静态回退。
+    pairingServerUrl: ''
     # 二维码仅一次有效，默认 5 分钟；范围为 1 至 15 分钟。
     localPairingQrTtlMs: 300000
 
@@ -76,7 +78,9 @@ Harness 会话暴露给已配对手机，应只在确有需要时启用。
 ## HTTPS 局域网访问与安装
 
 不要使用 `dsh web --host 0.0.0.0` 或 `--trusted-host`。保留默认的本机监听，使用
-本项目的 TLS 代理：
+本项目的 TLS 代理。完整安装建议按仓库根目录 README 运行
+`.\scripts\start-mobile-lan.ps1`，它会自动启动 Harness、复用 CA 为当前物理局域网
+IPv4 重签服务证书、重启代理并更新动态端点文件。以下是手动部署原理：
 
 1. 为电脑的局域网 IP 或名称取得一张 TLS 证书。此仓库的 Android App 可将这台电脑
    的本地 CA 固定内置，因此无需让手机全局信任 CA；若使用 PWA 或其他客户端，仍应
