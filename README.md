@@ -17,8 +17,9 @@
 - 本机页面生成短时、一次性二维码，Android App 扫码配对。
 - HttpOnly Cookie 设备会话，最长 7 天；主动断开或 Harness 重启会提前失效。
 - 会话侧边栏、工作区分组、桌面任务同步开关和默认工作区选择。
-- Markdown、代码、链接缩略、复制消息和新对话分支。
-- 实时回答、工具/命令时间线、任务完成通知和待批准操作提醒。
+- GFM Markdown、表格、引用、任务列表、代码块、链接缩略、复制消息和新对话分支。
+- 按动画帧刷新的实时回答、思考过程、上下文注入、工具/命令时间线和任务完成通知。
+- 发送中/已送达反馈、模型工作阶段、处理耗时和待批准操作提醒。
 - 运行中消息队列：编辑、删除、单条插话和全部插话。
 - 权限预设、Agent 模式、模型与推理强度选择。
 - 浅色、深色和跟随系统主题。
@@ -47,7 +48,7 @@ flowchart LR
 
 | 路径 | 内容 |
 | --- | --- |
-| `plugin/` | `dsh-mobile-remote` Cordis 插件、PWA、TLS 代理和 41 项 smoke 测试。 |
+| `plugin/` | `dsh-mobile-remote` Cordis 插件、PWA、TLS 代理和 43 项 smoke 测试。 |
 | `android/` | Android 1.6 原生扫码启动器和受限 WebView。 |
 | `optional/dsh-tool-ssh/` | 可选 SSH 工具插件及 21 项回环 SSH 测试。 |
 | `docs/branding/` | App 图标源文件、生成结果与圆形/自适应遮罩预览。 |
@@ -262,7 +263,7 @@ $env:Path = "$env:JAVA_HOME\bin;$env:Path"
 
 当前基线：
 
-- `dsh-mobile-remote 0.8.0`：41 项 smoke 测试。
+- `dsh-mobile-remote 0.8.1`：43 项 smoke 测试。
 - `dsh-tool-ssh 0.2.0`：21 项回环 SSH 测试。
 - 两个 npm 生产依赖审计：0 个已知漏洞。
 - Android：`testDebugUnitTest`、`lintDebug`、`assembleDebug`。

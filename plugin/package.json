@@ -1,7 +1,7 @@
 {
   "name": "dsh-mobile-remote",
   "description": "Mobile remote-control companion app for dsh: a PWA served by the harness web server to chat with the agent and run SSH commands on the dsh-tool-ssh hosts from a phone",
-  "version": "0.8.0",
+  "version": "0.8.1",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
@@ -28,9 +28,10 @@
   "license": "MIT",
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1",
+    "dompurify": "^3.4.13",
+    "marked": "^16.4.2",
     "qrcode": "^1.5.4"
   },
-  "peerDependencies": {},
   "devDependencies": {
     "@deepseek-ai/cordis": "^4.0.1",
     "@deepseek-ai/schemastery": "^3.18.1"

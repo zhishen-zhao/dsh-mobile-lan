@@ -17,8 +17,9 @@ Bring a restricted [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-ha
 - Short-lived, single-use QR pairing generated only on the computer's loopback page.
 - Up-to-seven-day HttpOnly device session, revoked early on logout or Harness restart.
 - Session drawer, workspace grouping, optional desktop-session visibility, and a default workspace selector.
-- Markdown, code blocks, compact links, message copy, and conversation forks.
-- Live responses, collapsible tool/command timeline, completion notifications, and approval reminders.
+- GFM Markdown, tables, blockquotes, task lists, code blocks, compact links, message copy, and conversation forks.
+- Animation-frame live responses, reasoning, context injections, and collapsible tool/command timelines.
+- Sending/delivered feedback, model work phases, elapsed processing time, completion notifications, and approval reminders.
 - Running-turn queue editing, deletion, single-message steering, and steer-all.
 - Permission preset, agent preset, model, and reasoning-effort controls.
 - Light, dark, and system appearance modes.
@@ -47,7 +48,7 @@ Read [the repository security policy](SECURITY.md), [the mobile plugin threat mo
 
 | Path | Purpose |
 | --- | --- |
-| `plugin/` | `dsh-mobile-remote` Cordis plugin, PWA, TLS proxy, and 41 smoke tests. |
+| `plugin/` | `dsh-mobile-remote` Cordis plugin, PWA, TLS proxy, and 43 smoke tests. |
 | `android/` | Android 1.6 QR launcher and restricted WebView client. |
 | `optional/dsh-tool-ssh/` | Optional SSH tool and 21 loopback SSH tests. |
 | `docs/branding/` | App icon source, generated master, and launcher-mask preview. |
@@ -256,7 +257,7 @@ $env:Path = "$env:JAVA_HOME\bin;$env:Path"
 
 Current verified baseline:
 
-- `dsh-mobile-remote 0.8.0`: 41 smoke checks.
+- `dsh-mobile-remote 0.8.1`: 43 smoke checks.
 - `dsh-tool-ssh 0.2.0`: 21 loopback SSH checks.
 - Production npm dependency audits: zero known vulnerabilities.
 - Android: `testDebugUnitTest`, `lintDebug`, and `assembleDebug` pass.

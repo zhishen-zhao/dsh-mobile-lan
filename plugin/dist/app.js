@@ -1,21 +1,41 @@
 /* dsh-mobile-remote - restricted phone control surface. */
 "use strict";
 
+import { marked } from "/mobile/vendor/marked.js";
+import DOMPurify from "/mobile/vendor/dompurify.js";
+
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 const MODE_NAMES = { standard: "标准模式", code: "PTC 模式", minimal: "极简模式", cordis: "创造模式" };
 const PERMISSION_NAMES = { "read-only": "Read Only", "workspace-write": "Workspace Write", "danger-full-access": "Full access" };
+marked.setOptions({ gfm: true, breaks: true, pedantic: false, async: false });
 
 let state = null;
 let controls = null;
 let currentSessionId = null;
 let polling = false;
 let eventSource = null;
-let refreshQueued = false;
+let stateRefreshTimer = null;
+let historyRefreshTimer = null;
+let historyRefreshRunning = false;
+let historyRefreshPending = false;
+let historyLoading = false;
+let liveEventBacklog = [];
+let historyEventSeqs = new Set();
 let reconnectTimer = null;
 let reconnectAttempt = 0;
 let lastCompletionAt = 0;
 let historyActiveTool = null;
+let lastRealtimeEventAt = 0;
+let liveRenderFrame = null;
+let liveBlocks = new Map();
+let liveToolNodes = new Map();
+let liveCommandNodes = new Map();
+let pendingOutbound = [];
+let turnStartedAt = null;
+let workingPhase = null;
+let workingTool = null;
+let workingTicker = null;
 let pendingDangerPreset = null;
 let queueExpanded = false;
 let connection = { phase: "connecting", latencyMs: null, detail: "正在连接 Harness…" };
@@ -67,9 +87,21 @@ async function api(path, { method = "GET", body, query = {} } = {}) {
   return data;
 }
 
+async function updateLatency() {
+  const startedAt = performance.now();
+  try {
+    await api("/ping");
+    const latency = Math.max(1, Math.round(performance.now() - startedAt));
+    setConnection("online", `已连接到本机 Harness，实时通道往返 ${latency}ms`, latency);
+  } catch {}
+}
+
 function logout() {
   stopSse();
   stopReconnectTimer();
+  finishWorking();
+  resetLiveRendering();
+  pendingOutbound = [];
   closeDrawer();
   closeSheet();
   state = null;
@@ -103,19 +135,19 @@ async function enter(data, latencyMs = null) {
   renderDeviceSession(data.deviceSession);
   renderSsh(data.ssh);
   renderStatusLine();
-  await selectCurrentSession();
-  setConnection("online", `已连接到本机 Harness${latencyMs === null ? "" : `，往返 ${latencyMs}ms`}`, latencyMs);
+  setConnection("online", "已连接到本机 Harness，正在同步当前会话…", latencyMs);
   reconnectAttempt = 0;
   stopReconnectTimer();
   startSse();
+  void updateLatency();
+  await selectCurrentSession();
 }
 
 async function reconnect(quiet = false) {
   setConnection("connecting", "正在检查电脑与 Harness 服务…");
-  const startedAt = performance.now();
   try {
     const data = await api("/state");
-    await enter(data, Math.max(1, Math.round(performance.now() - startedAt)));
+    await enter(data);
     if ((data.sessions ?? []).filter((item) => !item.archived).length === 0) await createSession();
   } catch (error) {
     if (state !== null) {
@@ -127,7 +159,6 @@ async function reconnect(quiet = false) {
 }
 
 async function refresh({ quiet = false } = {}) {
-  const startedAt = performance.now();
   try {
     const data = await api("/state");
     state = data;
@@ -136,8 +167,7 @@ async function refresh({ quiet = false } = {}) {
     renderDeviceSession(data.deviceSession);
     renderSsh(data.ssh);
     renderStatusLine();
-    const latency = Math.max(1, Math.round(performance.now() - startedAt));
-    setConnection("online", `已连接到本机 Harness，往返 ${latency}ms`, latency);
+    setConnection("online", connection.latencyMs === null ? "已连接到本机 Harness" : `已连接到本机 Harness，实时通道往返 ${connection.latencyMs}ms`, connection.latencyMs);
     reconnectAttempt = 0;
     stopReconnectTimer();
     return true;
@@ -258,6 +288,9 @@ function currentSummary() {
 }
 
 async function chooseSession(sessionId) {
+  finishWorking();
+  resetLiveRendering();
+  pendingOutbound = [];
   currentSessionId = sessionId;
   queueExpanded = false;
   $("session-select").value = sessionId;
@@ -282,13 +315,59 @@ function renderActivity(summary) {
   }
   const parts = [];
   const activeTool = activity?.activeTool ?? (summary?.running ? historyActiveTool : null);
-  if (activeTool) parts.push(`正在运行 ${activeTool}`);
-  else if (summary?.running === true) parts.push("模型正在处理…");
+  if (summary?.running === true) {
+    const phase = workingPhase ?? (activeTool ? `正在执行 ${activeTool}` : "模型正在处理");
+    const elapsed = turnStartedAt === null ? "" : ` · ${formatDuration(Date.now() - turnStartedAt)}`;
+    parts.push(`${phase}${workingTool && !phase.includes(workingTool) ? ` ${workingTool}` : ""}${elapsed}`);
+    const model = currentModelDisplayName();
+    if (model) parts.push(model);
+  }
   if ((activity?.jobs ?? 0) > 0) parts.push(`${activity.jobs} 个后台任务`);
   if ((activity?.queueLength ?? 0) > 0) parts.push(`${activity.queueLength} 条消息排队`);
   if (parts.length === 0) banner.classList.add("hidden");
   else { text.textContent = parts.join(" · "); banner.classList.remove("hidden"); }
   if ((activity?.lastCompletedAt ?? 0) > lastCompletionAt) { lastCompletionAt = activity.lastCompletedAt; toast("任务已完成"); }
+}
+
+function formatDuration(milliseconds) {
+  const seconds = Math.max(0, milliseconds) / 1000;
+  if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
+  const minutes = Math.floor(seconds / 60);
+  return `${minutes}m ${Math.floor(seconds % 60)}s`;
+}
+
+function currentModelDisplayName() {
+  const current = controls?.models?.current;
+  if (!current) return "";
+  const group = (controls.models.groups ?? []).find((item) => item.id === current.provider);
+  return group?.models?.find((item) => item.id === current.model)?.name ?? current.model ?? "";
+}
+
+function updateWorkingClock() {
+  const summary = currentSummary();
+  if (summary?.running !== true) return;
+  const queue = summary.activity?.queueLength ?? 0;
+  const elapsed = turnStartedAt === null ? "" : ` · ${formatDuration(Date.now() - turnStartedAt)}`;
+  $("session-status").textContent = `${workingPhase ?? "运行中"}${elapsed}${queue > 0 ? ` · ${queue} 条排队` : ""}`;
+  renderActivity(summary);
+}
+
+function setWorkingPhase(phase, { tool = null, startedAt } = {}) {
+  workingPhase = phase;
+  workingTool = tool;
+  if (turnStartedAt === null) turnStartedAt = Number.isFinite(startedAt) ? startedAt : Date.now();
+  if (workingTicker === null) workingTicker = setInterval(updateWorkingClock, 250);
+  updateWorkingClock();
+}
+
+function finishWorking() {
+  const elapsed = turnStartedAt === null ? null : Date.now() - turnStartedAt;
+  if (workingTicker !== null) clearInterval(workingTicker);
+  workingTicker = null;
+  workingPhase = null;
+  workingTool = null;
+  turnStartedAt = null;
+  return elapsed;
 }
 
 function queueItemsFor(summary = currentSummary()) {
@@ -361,7 +440,8 @@ function renderStatusLine() {
     return;
   }
   const queue = summary.activity?.queueLength ?? 0;
-  $("session-status").textContent = summary.running ? `运行中${queue > 0 ? ` · ${queue} 条排队` : " · 可继续发送"}` : `空闲 · ${currentWorkspaceName(summary.workspaceId)}`;
+  const elapsed = summary.running && turnStartedAt !== null ? ` · ${formatDuration(Date.now() - turnStartedAt)}` : "";
+  $("session-status").textContent = summary.running ? `${workingPhase ?? "运行中"}${elapsed}${queue > 0 ? ` · ${queue} 条排队` : " · 可继续发送"}` : `空闲 · ${currentWorkspaceName(summary.workspaceId)}`;
   $("btn-cancel").classList.toggle("hidden", !summary.running);
   renderActivity(summary);
   renderQueue(summary);
@@ -384,6 +464,7 @@ async function selectCurrentSession() {
     return;
   }
   await Promise.all([loadHistory(), loadControls()]);
+  if (currentSummary()?.running === true && turnStartedAt === null) setWorkingPhase("模型正在处理");
 }
 
 function blocksToText(content) {
@@ -439,41 +520,30 @@ function appendInlineMarkdown(container, value) {
 }
 
 function appendMarkdown(container, markdown) {
-  const lines = String(markdown ?? "").replace(/\r\n?/g, "\n").split("\n");
-  let paragraph = [];
-  let list = null;
-  let listType = null;
-  let code = null;
-  const flushParagraph = () => {
-    if (paragraph.length === 0) return;
-    const node = document.createElement("p");
-    paragraph.forEach((line, index) => { if (index > 0) node.appendChild(document.createElement("br")); appendInlineMarkdown(node, line); });
-    container.appendChild(node);
-    paragraph = [];
-  };
-  const closeList = () => { list = null; listType = null; };
-  for (const line of lines) {
-    if (/^```/.test(line)) {
-      if (code === null) { flushParagraph(); closeList(); code = []; }
-      else { const pre = document.createElement("pre"); const codeNode = document.createElement("code"); codeNode.textContent = code.join("\n"); pre.appendChild(codeNode); container.appendChild(pre); code = null; }
+  const source = String(markdown ?? "").replace(/\r\n?/g, "\n");
+  const html = marked.parse(source);
+  container.innerHTML = DOMPurify.sanitize(html, {
+    USE_PROFILES: { html: true },
+    FORBID_TAGS: ["audio", "embed", "iframe", "img", "math", "object", "script", "style", "svg", "video"],
+    FORBID_ATTR: ["style", "srcset", "onerror", "onclick", "onload"]
+  });
+  for (const link of container.querySelectorAll("a")) {
+    const href = link.getAttribute("href") ?? "";
+    let parsed;
+    try { parsed = href ? new URL(href, location.href) : null; } catch { parsed = null; }
+    if (parsed === null || !/^https?:$/i.test(parsed.protocol)) {
+      link.removeAttribute("href");
       continue;
     }
-    if (code !== null) { code.push(line); continue; }
-    if (line.trim() === "") { flushParagraph(); closeList(); continue; }
-    const heading = line.match(/^(#{1,4})\s+(.+)$/);
-    if (heading) { flushParagraph(); closeList(); const node = document.createElement(`h${heading[1].length + 1}`); appendInlineMarkdown(node, heading[2]); container.appendChild(node); continue; }
-    const item = line.match(/^\s*([-*+] |\d+\. )(.+)$/);
-    if (item) {
-      flushParagraph();
-      const ordered = /^\d/.test(item[1]);
-      if (list === null || listType !== ordered) { closeList(); list = document.createElement(ordered ? "ol" : "ul"); listType = ordered; container.appendChild(list); }
-      const li = document.createElement("li"); appendInlineMarkdown(li, item[2]); list.appendChild(li); continue;
+    link.target = "_blank";
+    link.rel = "noopener noreferrer";
+    link.title = href;
+    if (link.textContent === href) {
+      try {
+        link.textContent = `${parsed.hostname}${parsed.pathname.length > 1 ? " / …" : ""}`;
+      } catch {}
     }
-    closeList();
-    paragraph.push(line);
   }
-  if (code !== null) { const pre = document.createElement("pre"); const codeNode = document.createElement("code"); codeNode.textContent = code.join("\n"); pre.appendChild(codeNode); container.appendChild(pre); }
-  flushParagraph();
 }
 
 function redactOperationText(value, limit = 12_000) {
@@ -609,6 +679,45 @@ function appendCommandResult(node, event) {
   if (data.text) { const label = document.createElement("strong"); label.textContent = "结果"; const pre = document.createElement("pre"); pre.textContent = redactOperationText(data.text); node.body.append(label, pre); }
 }
 
+function contextSourceMeta(source) {
+  const kind = typeof source?.kind === "string" ? source.kind : "context";
+  if (kind === "session-reference") {
+    const labels = Array.isArray(source.references) ? source.references.map((item) => item?.label).filter(Boolean) : [];
+    return { title: "会话上下文", subtitle: labels.join("、") || "历史引用", icon: "↶" };
+  }
+  if (kind === "agent-instructions") {
+    const paths = Array.isArray(source.changes) ? source.changes.map((item) => item?.path).filter(Boolean) : [];
+    return { title: "上下文注入", subtitle: paths.join("、") || "Agent instructions", icon: "↳" };
+  }
+  if (kind === "plugin") return { title: "插件上下文", subtitle: source.plugin || kind, icon: "↳" };
+  if (kind === "skill-invocation") return { title: "Skill 上下文", subtitle: source.name || kind, icon: "↳" };
+  return { title: "上下文注入", subtitle: kind, icon: "↳" };
+}
+
+function renderReasoning(text, { running = false } = {}) {
+  if (!text) return null;
+  const node = createOperationNode({ icon: "∿", title: "思考过程", subtitle: "模型推理", status: running ? "思考中" : "已完成" });
+  node.details.classList.toggle("running", running);
+  node.details.classList.toggle("complete", !running);
+  const label = document.createElement("strong");
+  label.textContent = "推理内容";
+  const pre = document.createElement("pre");
+  pre.textContent = text;
+  node.body.append(label, pre);
+  return { ...node, pre };
+}
+
+function renderContextEvent(event) {
+  const data = event?.data ?? {};
+  const content = blocksToText(data.content ?? data.message?.content);
+  if (!content) return null;
+  const meta = contextSourceMeta(data.source);
+  const node = createOperationNode({ ...meta, input: redactOperationText(content), status: "已注入" });
+  node.details.classList.remove("running");
+  node.details.classList.add("complete", "context-row");
+  return node.details;
+}
+
 function addMessageActions(box, text, { seq, canFork = false } = {}) {
   const actions = document.createElement("div");
   actions.className = "message-actions";
@@ -655,7 +764,7 @@ function renderEvent(event, options = {}) {
   const type = event?.type;
   const data = event?.data ?? {};
   if (type === "user/message") {
-    if (data.source !== undefined && data.source?.kind !== "user") return null;
+    if (data.source !== undefined && data.source?.kind !== "user") return renderContextEvent(event);
     box.className = "msg user";
     const content = blocksToText(data.content) || "（空）";
     appendMarkdown(box, content);
@@ -691,20 +800,212 @@ async function forkFromMessage(atSeq) {
 function textDelta(event) {
   const chunk = event?.data?.chunk;
   if (chunk?.type !== "text-delta" || typeof chunk.text !== "string") return "";
-  return chunk.index === undefined || chunk.index === 1 ? chunk.text : "";
+  return chunk.text;
+}
+
+function applyPartialChunk(blocks, chunk) {
+  if (chunk === null || typeof chunk !== "object" || !Number.isSafeInteger(chunk.index)) return;
+  if (chunk.type === "block-start") {
+    blocks.set(chunk.index, { type: chunk.blockType, text: "", name: "", callId: "", arguments: "" });
+    return;
+  }
+  if (chunk.type === "text-delta" || chunk.type === "reasoning-delta") {
+    const type = chunk.type === "text-delta" ? "text" : "reasoning";
+    const block = blocks.get(chunk.index) ?? { type, text: "", name: "", callId: "", arguments: "" };
+    block.type = type;
+    block.text += typeof chunk.text === "string" ? chunk.text : "";
+    blocks.set(chunk.index, block);
+    return;
+  }
+  if (chunk.type === "tool-call-delta") {
+    const block = blocks.get(chunk.index) ?? { type: "tool-call", text: "", name: "", callId: "", arguments: "" };
+    block.type = "tool-call";
+    if (typeof chunk.id === "string" && chunk.id) block.callId = chunk.id;
+    if (typeof chunk.name === "string" && chunk.name) block.name = chunk.name;
+    block.arguments += typeof chunk.argumentsDelta === "string" ? chunk.argumentsDelta : "";
+    blocks.set(chunk.index, block);
+    return;
+  }
+  if (chunk.type === "block-end" && chunk.block !== null && typeof chunk.block === "object") {
+    if (chunk.block.type === "text" || chunk.block.type === "reasoning") blocks.set(chunk.index, { type: chunk.block.type, text: chunk.block.text ?? "", name: "", callId: "", arguments: "" });
+    else if (chunk.block.type === "tool-call") blocks.set(chunk.index, { type: "tool-call", text: "", name: chunk.block.name ?? "", callId: chunk.block.id ?? "", arguments: chunk.block.arguments ?? "" });
+  }
+}
+
+function appendPartialBlocks(container, blocks, { running = true } = {}) {
+  let rendered = 0;
+  for (const [, block] of [...blocks].sort((a, b) => a[0] - b[0])) {
+    if (block.type === "reasoning" && block.text) {
+      const node = renderReasoning(block.text, { running });
+      if (node !== null) { container.appendChild(node.details); rendered += 1; }
+    } else if (block.type === "text" && block.text) {
+      const box = renderEvent({ type: "assistant/message", data: { message: { content: [{ type: "text", text: block.text }] } } });
+      if (box !== null) { container.appendChild(box); rendered += 1; }
+    } else if (block.type === "tool-call" && (block.name || block.arguments)) {
+      const node = createOperationNode({ icon: "⚙", title: block.name || "工具调用", subtitle: "模型正在准备工具", input: formatOperationInput(block.arguments), status: running ? "准备中" : "待执行" });
+      node.details.classList.toggle("running", running);
+      node.details.dataset.callId = block.callId;
+      container.appendChild(node.details);
+      rendered += 1;
+    }
+  }
+  return rendered;
+}
+
+function messagesNearBottom() {
+  const container = $("messages");
+  return container.scrollHeight - container.scrollTop - container.clientHeight < 90;
+}
+
+function appendLiveNode(node) {
+  const container = $("messages");
+  if (container.querySelector(".empty-tip")) container.innerHTML = "";
+  const follow = messagesNearBottom();
+  container.appendChild(node);
+  if (follow) container.scrollTop = container.scrollHeight;
+}
+
+function resetLiveRendering() {
+  if (liveRenderFrame !== null) cancelAnimationFrame(liveRenderFrame);
+  liveRenderFrame = null;
+  liveBlocks = new Map();
+  liveToolNodes = new Map();
+  liveCommandNodes = new Map();
+}
+
+function scheduleLivePaint() {
+  if (liveRenderFrame !== null) return;
+  liveRenderFrame = requestAnimationFrame(() => {
+    liveRenderFrame = null;
+    const container = $("messages");
+    const follow = messagesNearBottom();
+    if (container.querySelector(".empty-tip")) container.innerHTML = "";
+    for (const block of liveBlocks.values()) {
+      if (!block.dirty) continue;
+      block.dirty = false;
+      if (block.type === "text") {
+        if (block.node === null && block.text) {
+          block.node = document.createElement("div");
+          block.node.className = "msg assistant streaming";
+          container.appendChild(block.node);
+        }
+        if (block.node !== null) block.node.textContent = block.text;
+      } else if (block.type === "reasoning") {
+        if (block.node === null && block.text) {
+          const rendered = renderReasoning(block.text, { running: !block.complete });
+          if (rendered !== null) { block.node = rendered; container.appendChild(rendered.details); }
+        } else if (block.node !== null) {
+          block.node.pre.textContent = block.text;
+          block.node.details.classList.toggle("running", !block.complete);
+          block.node.details.classList.toggle("complete", block.complete);
+          block.node.statusNode.textContent = block.complete ? "已完成" : "思考中";
+        }
+      } else if (block.type === "tool-call") {
+        if (block.node === null && (block.name || block.arguments)) {
+          const rendered = createOperationNode({ icon: "⚙", title: block.name || "工具调用", subtitle: "模型正在准备工具", input: "", status: block.complete ? "待执行" : "准备中" });
+          const label = document.createElement("strong");
+          label.textContent = "输入";
+          const pre = document.createElement("pre");
+          rendered.body.append(label, pre);
+          rendered.details.dataset.callId = block.callId;
+          block.node = { ...rendered, pre };
+          container.appendChild(rendered.details);
+          if (block.callId) liveToolNodes.set(block.callId, rendered);
+        }
+        if (block.node !== null) {
+          block.node.pre.textContent = formatOperationInput(block.arguments);
+          block.node.details.dataset.callId = block.callId;
+          block.node.statusNode.textContent = block.complete ? "待执行" : "准备中";
+          if (block.callId) liveToolNodes.set(block.callId, block.node);
+        }
+      }
+    }
+    if (follow) container.scrollTop = container.scrollHeight;
+  });
+}
+
+function applyLiveChunk(event) {
+  const chunk = event?.data?.chunk;
+  if (chunk === null || typeof chunk !== "object" || !Number.isSafeInteger(chunk.index)) return;
+  const key = `${event.data?.turn ?? 0}:${event.data?.step ?? 0}:${chunk.index}`;
+  let block = liveBlocks.get(key);
+  if (chunk.type === "block-start") {
+    block = { type: chunk.blockType, text: "", name: "", callId: "", arguments: "", complete: false, dirty: true, node: null };
+    liveBlocks.set(key, block);
+  } else if (chunk.type === "text-delta" || chunk.type === "reasoning-delta") {
+    const type = chunk.type === "text-delta" ? "text" : "reasoning";
+    block ??= { type, text: "", name: "", callId: "", arguments: "", complete: false, dirty: true, node: null };
+    block.type = type;
+    block.text += typeof chunk.text === "string" ? chunk.text : "";
+    block.dirty = true;
+    liveBlocks.set(key, block);
+  } else if (chunk.type === "tool-call-delta") {
+    block ??= { type: "tool-call", text: "", name: "", callId: "", arguments: "", complete: false, dirty: true, node: null };
+    block.type = "tool-call";
+    if (typeof chunk.id === "string" && chunk.id) block.callId = chunk.id;
+    if (typeof chunk.name === "string" && chunk.name) block.name = chunk.name;
+    block.arguments += typeof chunk.argumentsDelta === "string" ? chunk.argumentsDelta : "";
+    block.dirty = true;
+    liveBlocks.set(key, block);
+  } else if (chunk.type === "block-end" && chunk.block !== null && typeof chunk.block === "object") {
+    const type = chunk.block.type;
+    block ??= { type, text: "", name: "", callId: "", arguments: "", complete: false, dirty: true, node: null };
+    block.type = type;
+    if (type === "text" || type === "reasoning") block.text = chunk.block.text ?? block.text;
+    if (type === "tool-call") { block.name = chunk.block.name ?? block.name; block.callId = chunk.block.id ?? block.callId; block.arguments = chunk.block.arguments ?? block.arguments; }
+    block.complete = true;
+    block.dirty = true;
+    liveBlocks.set(key, block);
+  }
+  scheduleLivePaint();
+}
+
+function setCurrentRunning(running) {
+  const summary = currentSummary();
+  if (summary === undefined) return;
+  summary.running = running;
+  renderStatusLine();
+}
+
+function appendPendingUserMessage(text) {
+  const box = renderEvent({ type: "user/message", data: { content: [{ type: "text", text }], source: { kind: "user" } } });
+  if (box === null) return null;
+  box.classList.add("pending-message");
+  const status = document.createElement("span");
+  status.className = "delivery-status";
+  status.textContent = "正在发送…";
+  box.appendChild(status);
+  appendLiveNode(box);
+  const pending = { text, box, status };
+  pendingOutbound.push(pending);
+  return pending;
+}
+
+function settlePendingMessage(pending, outcome) {
+  if (pending === null || pending === undefined) return;
+  pending.box.classList.remove("pending-message");
+  pending.box.classList.toggle("failed-message", outcome === "failed");
+  pending.status.textContent = outcome === "failed" ? "发送失败" : outcome === "received" ? "Harness 已接收" : "已送达";
+  if (outcome === "received") setTimeout(() => pending.status.remove(), 1800);
+  if (outcome !== "sent") pendingOutbound = pendingOutbound.filter((item) => item !== pending);
 }
 
 async function loadHistory() {
   const sessionId = currentSessionId;
   if (sessionId === null) return;
+  if (historyLoading) { historyRefreshPending = true; return; }
+  historyLoading = true;
   try {
     const history = await api("/history", { query: { sessionId, maxMessages: 80 } });
     if (sessionId !== currentSessionId) return;
+    historyEventSeqs = new Set((history.events ?? []).map((entry) => entry?.event?.seq).filter((seq) => Number.isSafeInteger(seq)));
     const container = $("messages");
     const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 60;
+    resetLiveRendering();
+    pendingOutbound = [];
     container.innerHTML = "";
     let rendered = 0;
-    let streamingText = "";
+    const partialBlocks = new Map();
     historyActiveTool = null;
     const endedTurns = new Set();
     const lastAssistantSeqByTurn = new Map();
@@ -716,7 +1017,7 @@ async function loadHistory() {
       if (event?.type === "assistant/message") lastAssistantSeqByTurn.set(event.data?.turn, event.seq);
     }
     for (const entry of history.events ?? []) {
-      if (entry.event?.type === "assistant/chunk") { streamingText += textDelta(entry.event); continue; }
+      if (entry.event?.type === "assistant/chunk") { applyPartialChunk(partialBlocks, entry.event.data?.chunk); continue; }
       if (entry.event?.type === "tool/call") {
         const node = renderToolCall(entry);
         toolNodes.set(entry.event.data?.callId, node);
@@ -756,22 +1057,33 @@ async function loadHistory() {
         continue;
       }
       if (entry.event?.type === "turn/end") { historyActiveTool = null; continue; }
-      if (entry.event?.type === "assistant/message") streamingText = "";
+      if (entry.event?.type === "assistant/message") {
+        partialBlocks.clear();
+        const content = entry.event.data?.message?.content ?? entry.event.data?.content;
+        for (const block of Array.isArray(content) ? content : []) {
+          if (block?.type !== "reasoning" || typeof block.text !== "string" || block.text.length === 0) continue;
+          const node = renderReasoning(block.text);
+          if (node !== null) { container.appendChild(node.details); rendered += 1; }
+        }
+      }
       const event = entry.event;
       const turn = event?.data?.turn;
       const canFork = event?.type === "assistant/message" && endedTurns.has(turn) && lastAssistantSeqByTurn.get(turn) === event.seq;
       const box = renderEvent(event, { seq: event?.seq, canFork });
       if (box !== null) { container.appendChild(box); rendered += 1; }
     }
-    if (streamingText) {
-      const box = renderEvent({ type: "assistant/message", data: { message: { content: [{ type: "text", text: streamingText }] } } });
-      if (box !== null) { container.appendChild(box); rendered += 1; }
-    }
+    rendered += appendPartialBlocks(container, partialBlocks, { running: currentSummary()?.running === true });
     renderActivity(currentSummary());
     if (rendered === 0) container.innerHTML = '<div class="empty-tip">输入任务开始对话</div>';
     else if (atBottom) container.scrollTop = container.scrollHeight;
   } catch (error) {
     if (state !== null) setConnection("offline", `历史同步失败：${String(error.message ?? error)}`);
+  } finally {
+    historyLoading = false;
+    const backlog = liveEventBacklog;
+    liveEventBacklog = [];
+    for (const payload of backlog) handleRealtimePayload(payload, true);
+    if (historyRefreshPending) { historyRefreshPending = false; scheduleHistoryRefresh(0); }
   }
 }
 
@@ -780,7 +1092,9 @@ async function pollWhileRunning() {
   polling = true;
   try {
     while (currentSummary()?.running === true) {
-      await sleep(1_500);
+      await sleep(4_000);
+      const realtimeHealthy = eventSource?.readyState === EventSource.OPEN && Date.now() - lastRealtimeEventAt < 8_000;
+      if (realtimeHealthy) continue;
       if (!await refresh({ quiet: true })) break;
       await loadHistory();
     }
@@ -792,12 +1106,18 @@ async function sendPrompt() {
   if (!text || currentSessionId === null) return syncComposer();
   $("input").value = "";
   $("btn-send").disabled = true;
+  const pending = appendPendingUserMessage(text);
+  setCurrentRunning(true);
+  setWorkingPhase("正在发送消息");
   try {
     await api("/prompt", { method: "POST", body: { sessionId: currentSessionId, text } });
-    await loadHistory();
-    await refresh({ quiet: true });
+    settlePendingMessage(pending, "sent");
+    setWorkingPhase("等待模型响应");
+    setTimeout(() => {
+      if (pendingOutbound.includes(pending) && Date.now() - lastRealtimeEventAt > 1_500) scheduleHistoryRefresh(0);
+    }, 1_600);
     void pollWhileRunning();
-  } catch (error) { toast(String(error.message ?? error)); await refresh({ quiet: true }); }
+  } catch (error) { settlePendingMessage(pending, "failed"); finishWorking(); setCurrentRunning(false); toast(String(error.message ?? error)); await refresh({ quiet: true }); }
   finally { syncComposer(); }
 }
 
@@ -1138,25 +1458,155 @@ async function saveWorkspace() {
   } catch (error) { toast(String(error.message ?? error)); }
 }
 
-function queueEventRefresh() {
-  if (refreshQueued) return;
-  refreshQueued = true;
-  setTimeout(async () => {
-    refreshQueued = false;
-    if (await refresh({ quiet: true })) await Promise.all([loadHistory(), loadControls(true)]);
-  }, 250);
+function scheduleStateRefresh(delay = 120) {
+  if (stateRefreshTimer !== null) clearTimeout(stateRefreshTimer);
+  stateRefreshTimer = setTimeout(async () => {
+    stateRefreshTimer = null;
+    await refresh({ quiet: true });
+  }, delay);
+}
+
+function scheduleHistoryRefresh(delay = 100) {
+  if (historyRefreshTimer !== null) clearTimeout(historyRefreshTimer);
+  historyRefreshTimer = setTimeout(async () => {
+    historyRefreshTimer = null;
+    if (historyRefreshRunning) { historyRefreshPending = true; return; }
+    historyRefreshRunning = true;
+    try { await loadHistory(); }
+    finally {
+      historyRefreshRunning = false;
+      if (historyRefreshPending) { historyRefreshPending = false; scheduleHistoryRefresh(0); }
+    }
+  }, delay);
+}
+
+function currentActivity() {
+  return currentSummary()?.activity;
+}
+
+function applyAuxiliaryFrame(payload) {
+  const activity = currentActivity();
+  if (activity === undefined) return;
+  if (payload.type === "session/queue") {
+    activity.queueItems = (Array.isArray(payload.items) ? payload.items : []).map((item) => {
+      const content = Array.isArray(item?.message?.content) ? item.message.content : [];
+      return { id: item.id, placement: item.placement, text: blocksToText(content), editable: content.length > 0 && content.every((block) => block?.type === "text") };
+    }).filter((item) => typeof item.id === "string");
+    activity.queueLength = activity.queueItems.filter((item) => item.placement === "queued").length;
+  } else if (payload.type === "session/jobs") activity.jobs = Array.isArray(payload.jobs) ? payload.jobs.length : 0;
+  else if (payload.type === "approval/requested") activity.pendingApproval = { toolName: payload.toolName, reason: payload.reason };
+  else if (payload.type === "approval/resolved") activity.pendingApproval = void 0;
+  renderStatusLine();
+}
+
+function appendRealtimeNode(node) {
+  if (node === null) return;
+  appendLiveNode(node);
+}
+
+function handleRealtimePayload(payload, replay = false) {
+  if (payload === null || typeof payload !== "object" || payload.sessionId !== currentSessionId) return;
+  if (historyLoading && !replay) { liveEventBacklog.push(payload); return; }
+  lastRealtimeEventAt = Date.now();
+  if (payload.type !== "session/event") { applyAuxiliaryFrame(payload); if (["session/queue", "session/jobs", "approval/requested", "approval/resolved"].includes(payload.type)) return; }
+  const event = payload.event;
+  if (event === null || typeof event !== "object") return;
+  if (replay && Number.isSafeInteger(event.seq) && historyEventSeqs.has(event.seq)) return;
+  const type = event.type;
+  if (type === "assistant/chunk") {
+    setCurrentRunning(true);
+    const chunkType = event.data?.chunk?.type;
+    if (chunkType === "reasoning-delta") setWorkingPhase("正在思考");
+    else if (chunkType === "text-delta") setWorkingPhase("正在生成回复");
+    else if (chunkType === "tool-call-delta") setWorkingPhase("正在准备工具", { tool: event.data?.chunk?.name ?? workingTool });
+    applyLiveChunk(event);
+    return;
+  }
+  if (type === "turn/start" || type === "step/start") {
+    setCurrentRunning(true);
+    setWorkingPhase(type === "turn/start" ? "正在分析任务" : "正在准备模型请求", { startedAt: event.time });
+    return;
+  }
+  if (type === "user/message") {
+    const content = blocksToText(event.data?.content ?? event.data?.message?.content);
+    if (event.data?.source?.kind === "user") {
+      const pending = pendingOutbound.find((item) => item.text === content);
+      if (pending !== undefined) { settlePendingMessage(pending, "received"); return; }
+    } else setWorkingPhase("正在注入上下文");
+    appendRealtimeNode(renderEvent(event, { seq: event.seq }));
+    return;
+  }
+  if (type === "tool/call") {
+    const callId = event.data?.callId;
+    const toolName = event.data?.name ?? "工具";
+    const activity = currentActivity();
+    if (activity !== undefined) activity.activeTool = toolName;
+    setWorkingPhase("正在执行工具", { tool: toolName });
+    let node = liveToolNodes.get(callId);
+    if (node === undefined) {
+      node = renderToolCall({ event, view: payload.view });
+      liveToolNodes.set(callId, node);
+      appendRealtimeNode(node.details);
+    } else {
+      node.details.classList.add("running");
+      node.details.classList.remove("complete", "failed");
+      node.statusNode.textContent = "正在执行";
+    }
+    return;
+  }
+  if (type === "tool/result") {
+    const resultBlock = event.data?.message?.content?.find?.((item) => item?.type === "tool-result");
+    const callId = event.data?.message?.source?.callId ?? resultBlock?.toolCallId;
+    let node = liveToolNodes.get(callId);
+    if (node === undefined) {
+      node = createOperationNode({ icon: "⚙", title: "工具结果", subtitle: "工具调用" });
+      appendRealtimeNode(node.details);
+      liveToolNodes.set(callId, node);
+    }
+    appendToolResult(node, { event, view: payload.view });
+    const activity = currentActivity();
+    if (activity !== undefined) activity.activeTool = void 0;
+    setWorkingPhase("正在处理工具结果");
+    return;
+  }
+  if (type === "command/run") {
+    const node = renderCommandRun(event);
+    liveCommandNodes.set(event.data?.commandId, node);
+    appendRealtimeNode(node.details);
+    return;
+  }
+  if (type === "command/done") {
+    const node = liveCommandNodes.get(event.data?.commandId);
+    if (node !== undefined) appendCommandResult(node, event);
+    else {
+      const fallback = createOperationNode({ icon: "/", title: "Harness 命令", subtitle: "命令结果" });
+      appendCommandResult(fallback, event);
+      appendRealtimeNode(fallback.details);
+    }
+    return;
+  }
+  if (type === "assistant/message") { setWorkingPhase("正在整理回复"); return; }
+  if (type === "turn/end") {
+    setCurrentRunning(false);
+    const elapsed = finishWorking();
+    const activity = currentActivity();
+    const completedAt = Date.now();
+    if (activity !== undefined) { activity.activeTool = void 0; activity.lastCompletedAt = completedAt; }
+    lastCompletionAt = completedAt;
+    toast(elapsed === null ? "任务已完成" : `任务已完成 · ${formatDuration(elapsed)}`);
+    renderActivity(currentSummary());
+    scheduleHistoryRefresh(120);
+    scheduleStateRefresh(180);
+  }
 }
 
 function startSse() {
   stopSse();
   try {
     eventSource = new EventSource("/mobile-api/events");
-    eventSource.onopen = () => setConnection("online", connection.detail, connection.latencyMs);
+    eventSource.onopen = () => { lastRealtimeEventAt = Date.now(); setConnection("online", connection.detail, connection.latencyMs); void updateLatency(); };
     eventSource.onmessage = (message) => {
-      try {
-        const payload = JSON.parse(message.data)?.payload;
-        if (payload?.sessionId === currentSessionId && ["session/event", "session/queue", "session/jobs", "approval/requested", "approval/resolved", "question/requested"].includes(payload.type)) queueEventRefresh();
-      } catch {}
+      try { handleRealtimePayload(JSON.parse(message.data)?.payload); } catch {}
     };
     eventSource.onerror = () => { stopSse(); if (state !== null) { setConnection("offline", "实时连接断开，正在自动重连…"); scheduleReconnect(); } };
   } catch { setConnection("offline", "无法建立实时连接，正在自动重连…"); scheduleReconnect(); }

@@ -56,6 +56,7 @@ const Config = z.object({
 const MIME = {
 	".html": "text/html; charset=utf-8",
 	".js": "text/javascript; charset=utf-8",
+	".mjs": "text/javascript; charset=utf-8",
 	".css": "text/css; charset=utf-8",
 	".json": "application/json; charset=utf-8",
 	".svg": "image/svg+xml",
@@ -76,6 +77,77 @@ function parsePairingServerOrigin(value, source) {
 	} catch {
 		throw new Error(`mobile-remote: ${source} must be an HTTPS origin without a path, query, fragment, or credentials`);
 	}
+}
+
+function compactHistoryEntries(entries) {
+	if (!Array.isArray(entries)) return [];
+	const output = [];
+	const pending = /* @__PURE__ */ new Map();
+	const keyOf = (event) => `${event?.data?.turn ?? ""}:${event?.data?.step ?? ""}`;
+	const applyChunk = (record, entry) => {
+		const event = entry.event;
+		const chunk = event?.data?.chunk;
+		if (chunk === null || typeof chunk !== "object" || !Number.isSafeInteger(chunk.index)) return;
+		let block = record.blocks.get(chunk.index);
+		if (chunk.type === "block-start") block = { type: chunk.blockType, text: "", id: "", name: "", arguments: "", firstSeq: event.seq, lastEntry: entry };
+		else if (chunk.type === "text-delta" || chunk.type === "reasoning-delta") {
+			block ??= { type: chunk.type === "text-delta" ? "text" : "reasoning", text: "", id: "", name: "", arguments: "", firstSeq: event.seq, lastEntry: entry };
+			block.type = chunk.type === "text-delta" ? "text" : "reasoning";
+			block.text += typeof chunk.text === "string" ? chunk.text : "";
+		} else if (chunk.type === "tool-call-delta") {
+			block ??= { type: "tool-call", text: "", id: "", name: "", arguments: "", firstSeq: event.seq, lastEntry: entry };
+			block.type = "tool-call";
+			if (typeof chunk.id === "string" && chunk.id) block.id = chunk.id;
+			if (typeof chunk.name === "string" && chunk.name) block.name = chunk.name;
+			block.arguments += typeof chunk.argumentsDelta === "string" ? chunk.argumentsDelta : "";
+		} else if (chunk.type === "block-end" && chunk.block !== null && typeof chunk.block === "object") {
+			const value = chunk.block;
+			block = { type: value.type, text: value.text ?? "", id: value.id ?? "", name: value.name ?? "", arguments: value.arguments ?? "", firstSeq: block?.firstSeq ?? event.seq, lastEntry: entry };
+		}
+		if (block !== void 0) {
+			block.lastEntry = entry;
+			record.blocks.set(chunk.index, block);
+		}
+	};
+	const flush = (key) => {
+		const record = pending.get(key);
+		if (record === void 0) return;
+		pending.delete(key);
+		for (const [index, block] of [...record.blocks].sort((a, b) => a[1].firstSeq - b[1].firstSeq)) {
+			let value;
+			if (block.type === "text" || block.type === "reasoning") value = { type: block.type, text: block.text };
+			else if (block.type === "tool-call") value = { type: "tool-call", id: block.id, name: block.name, arguments: block.arguments };
+			else continue;
+			const source = block.lastEntry;
+			output.push({
+				...source,
+				event: {
+					...source.event,
+					data: { ...source.event.data, chunk: { type: "block-end", index, block: value } }
+				}
+			});
+		}
+	};
+	const flushTurn = (turn) => {
+		for (const key of [...pending.keys()]) if (key.startsWith(`${turn}:`)) flush(key);
+	};
+	for (const entry of entries) {
+		const event = entry?.event;
+		if (event?.type === "assistant/chunk") {
+			const key = keyOf(event);
+			let record = pending.get(key);
+			if (record === void 0) { record = { blocks: /* @__PURE__ */ new Map() }; pending.set(key, record); }
+			applyChunk(record, entry);
+			continue;
+		}
+		const key = keyOf(event);
+		if (event?.type === "assistant/message") pending.delete(key);
+		else if (event?.type === "step/end") flush(key);
+		else if (event?.type === "turn/end") flushTurn(event.data?.turn);
+		output.push(entry);
+	}
+	for (const key of pending.keys()) flush(key);
+	return output;
 }
 
 const SECURITY_HEADERS = {
@@ -198,6 +270,10 @@ function apply(ctx, config = {}) {
 		return parsePairingServerOrigin(state.pairingServerUrl, "pairingServerUrlFile.pairingServerUrl");
 	};
 	const distDir = fileURLToPath(new URL("../dist/", import.meta.url));
+	const vendorAssets = new Map([
+		["vendor/marked.js", fileURLToPath(import.meta.resolve("marked"))],
+		["vendor/dompurify.js", fileURLToPath(import.meta.resolve("dompurify"))]
+	]);
 
 	const tokenDigest = sha256(token);
 	const pairingTokenMatches = (candidate) => {
@@ -306,9 +382,10 @@ function apply(ctx, config = {}) {
 	function serveAsset(res, asset) {
 		const requested = asset === "" ? "index.html" : asset;
 		const normalized = normalize(requested).replace(/\\/g, "/");
-		const file = join(distDir, normalized);
+		const vendorFile = vendorAssets.get(normalized);
+		const file = vendorFile ?? join(distDir, normalized);
 		const relativePath = relative(distDir, file);
-		if (relativePath.startsWith("..") || relativePath === "" || file === distDir) {
+		if (vendorFile === void 0 && (relativePath.startsWith("..") || relativePath === "" || file === distDir)) {
 			sendJson(res, 404, { ok: false, error: "not found" });
 			return;
 		}
@@ -547,6 +624,9 @@ function apply(ctx, config = {}) {
 			return sendJson(res, 401, { ok: false, error: token.length === 0 ? "mobile-remote: accessTokenEnv is not configured, API is disabled" : "unauthorized: pair this device first" });
 		}
 		try {
+			if (req.method === "GET" && path === "/ping") {
+				return sendJson(res, 200, { ok: true, serverTime: Date.now() });
+			}
 			if (req.method === "POST" && path === "/logout") {
 				endSession(req, res);
 				return sendJson(res, 200, { ok: true });
@@ -715,7 +795,7 @@ function apply(ctx, config = {}) {
 				const requested = Number(url.searchParams.get("maxMessages"));
 				const maxMessages = Number.isFinite(requested) && requested > 0 ? Math.min(Math.floor(requested), maxHistoryMessages) : maxHistoryMessages;
 				const history = await call(ctx.apiProxy.sessions.history, { sessionId, maxMessages });
-				return sendJson(res, 200, { ok: true, ...history });
+				return sendJson(res, 200, { ok: true, ...history, events: compactHistoryEntries(history.events) });
 			}
 			if (req.method === "POST" && path === "/ssh") {
 				const definition = sshTool();
@@ -750,13 +830,15 @@ function apply(ctx, config = {}) {
 				return sendJson(res, 200, { ok: true, result });
 			}
 			if (req.method === "GET" && path === "/events") {
+				req.socket?.setNoDelay?.(true);
 				res.writeHead(200, withSecurityHeaders({
 					"content-type": "text/event-stream; charset=utf-8",
-					"cache-control": "no-cache",
+					"cache-control": "no-cache, no-transform",
 					"connection": "keep-alive",
 					"x-accel-buffering": "no"
 				}));
-				res.write(": connected\n\n");
+				res.flushHeaders?.();
+				res.write("retry: 1000\n: connected\n\n");
 				res.on("error", () => {});
 				clients.set(res, sessionExpiresAt(req));
 				res.on("close", () => clients.delete(res));

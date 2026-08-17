@@ -73,9 +73,14 @@ const fakeApiProxy = {
 			calls.prompts.push({ cancel: request.payload });
 			return okResult(request, { accepted: true });
 		},
-		history: async (request) => okResult(request, { events: [{
-			event: { type: "user/message", data: { content: [{ type: "text", text: "你好" }] } }
-		}], hasMore: false, ...request.payload })
+		history: async (request) => okResult(request, { events: [
+			{ event: { type: "user/message", seq: 1, data: { content: [{ type: "text", text: "你好" }] } } },
+			{ event: { type: "assistant/chunk", seq: 2, data: { turn: 1, step: 1, chunk: { type: "block-start", index: 0, blockType: "reasoning" } } } },
+			{ event: { type: "assistant/chunk", seq: 3, data: { turn: 1, step: 1, chunk: { type: "reasoning-delta", index: 0, text: "思考" } } } },
+			{ event: { type: "assistant/chunk", seq: 4, data: { turn: 1, step: 1, chunk: { type: "block-start", index: 1, blockType: "text" } } } },
+			{ event: { type: "assistant/chunk", seq: 5, data: { turn: 1, step: 1, chunk: { type: "text-delta", index: 1, text: "完成" } } } },
+			{ event: { type: "assistant/message", seq: 6, data: { turn: 1, step: 1, message: { content: [{ type: "reasoning", text: "思考" }, { type: "text", text: "完成" }] } } } }
+		], hasMore: false, ...request.payload })
 	},
 	workspace: {
 		list: async (request) => okResult(request, { items: [{
@@ -248,9 +253,29 @@ async function main() {
 		assert.match(app.text, /data\.source\?\.kind !== "user"/);
 		assert.match(app.text, /historyActiveTool/);
 		assert.match(app.text, /renderDeviceSession/);
+		assert.match(app.text, /reasoning-delta/);
+		assert.match(app.text, /tool-call-delta/);
+		assert.match(app.text, /contextSourceMeta/);
+		assert.match(app.text, /requestAnimationFrame/);
+		assert.match(app.text, /Harness 已接收/);
+		assert.match(app.text, /formatDuration/);
+		assert.match(app.text, /DOMPurify\.sanitize/);
+		assert.match(app.text, /historyEventSeqs\.has\(event\.seq\)/);
+		assert.doesNotMatch(app.text, /queueEventRefresh/);
 		assert.match(app.text, /createElementNS\("http:\/\/www\.w3\.org\/2000\/svg", "svg"\)/);
 		assert.doesNotMatch(app.text, /fork\.textContent = "⎇"/);
 		ok("GET /mobile/app.js serves the online-only client script");
+	}
+	{
+		const marked = await request(server, port, "/mobile/vendor/marked.js");
+		const purify = await request(server, port, "/mobile/vendor/dompurify.js");
+		assert.equal(marked.status, 200);
+		assert.equal(purify.status, 200);
+		assert.match(marked.headers.get("content-type"), /javascript/);
+		assert.match(purify.headers.get("content-type"), /javascript/);
+		assert.match(marked.text, /marked/);
+		assert.match(purify.text, /DOMPurify/);
+		ok("GFM parser and HTML sanitizer are served as same-origin modules");
 	}
 	{
 		const appCss = await request(server, port, "/mobile/app.css");
@@ -379,6 +404,12 @@ async function main() {
 		ok("state scopes sessions, SSH aliases, and workspace choices to the mobile app");
 	}
 	{
+		const ping = await request(server, port, "/mobile-api/ping");
+		assert.equal(ping.status, 200);
+		assert.equal(typeof ping.json.serverTime, "number");
+		ok("lightweight ping measures transport latency without loading session state");
+	}
+	{
 		const workspace = await request(server, port, "/mobile-api/workspace", { method: "POST", body: { workspaceId: "w1" } });
 		assert.equal(workspace.status, 200);
 		assert.equal(workspace.json.workspace.defaultWorkspaceId, "w1");
@@ -466,7 +497,8 @@ async function main() {
 		const history = await request(server, port, "/mobile-api/history?sessionId=s-new");
 		assert.equal(history.status, 200);
 		assert.equal(history.json.events[0].event.type, "user/message");
-		ok("history proxies sessions.history");
+		assert.deepEqual(history.json.events.map((entry) => entry.event.type), ["user/message", "assistant/message"]);
+		ok("history removes completed token chunks while retaining the finalized reasoning and answer");
 	}
 
 	// ── SSH execution through the registered ssh tool ───────────────────────
