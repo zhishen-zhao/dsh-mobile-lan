@@ -48,9 +48,11 @@ flowchart LR
 | 路径 | 内容 |
 | --- | --- |
 | `plugin/` | `dsh-mobile-remote` Cordis 插件、PWA、TLS 代理和 38 项 smoke 测试。 |
-| `android/` | Android 1.5 原生扫码启动器和受限 WebView。 |
+| `android/` | Android 1.6 原生扫码启动器和受限 WebView。 |
 | `optional/dsh-tool-ssh/` | 可选 SSH 工具插件及 21 项回环 SSH 测试。 |
+| `docs/branding/` | App 图标源文件、生成结果与圆形/自适应遮罩预览。 |
 | `scripts/setup-local-tls.ps1` | 为当前安装生成 CA、服务证书、私钥并注入 Android 资源。 |
+| `scripts/generate-app-icons.py` | 从图标源文件重新生成 Android 与 PWA 全套尺寸。 |
 | `scripts/verify.ps1` | 运行插件、SSH 和 Android 的完整验证。 |
 
 ## 环境要求
@@ -251,7 +253,7 @@ $env:Path = "$env:JAVA_HOME\bin;$env:Path"
 
 当前基线：
 
-- `dsh-mobile-remote 0.7.2`：38 项 smoke 测试。
+- `dsh-mobile-remote 0.7.3`：38 项 smoke 测试。
 - `dsh-tool-ssh 0.2.0`：21 项回环 SSH 测试。
 - 两个 npm 生产依赖审计：0 个已知漏洞。
 - Android：`testDebugUnitTest`、`lintDebug`、`assembleDebug`。

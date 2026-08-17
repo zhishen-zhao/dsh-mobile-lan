@@ -48,9 +48,11 @@ Read [the repository security policy](SECURITY.md), [the mobile plugin threat mo
 | Path | Purpose |
 | --- | --- |
 | `plugin/` | `dsh-mobile-remote` Cordis plugin, PWA, TLS proxy, and 38 smoke tests. |
-| `android/` | Android 1.5 QR launcher and restricted WebView client. |
+| `android/` | Android 1.6 QR launcher and restricted WebView client. |
 | `optional/dsh-tool-ssh/` | Optional SSH tool and 21 loopback SSH tests. |
+| `docs/branding/` | App icon source, generated master, and launcher-mask preview. |
 | `scripts/setup-local-tls.ps1` | Generates a CA, server identity, and Android trust anchor for one installation. |
+| `scripts/generate-app-icons.py` | Regenerates the Android and PWA icon sets from the source artwork. |
 | `scripts/verify.ps1` | Runs the JavaScript, dependency, SSH, Android, and lint checks. |
 
 ## Requirements
@@ -246,7 +248,7 @@ $env:Path = "$env:JAVA_HOME\bin;$env:Path"
 
 Current verified baseline:
 
-- `dsh-mobile-remote 0.7.2`: 38 smoke checks.
+- `dsh-mobile-remote 0.7.3`: 38 smoke checks.
 - `dsh-tool-ssh 0.2.0`: 21 loopback SSH checks.
 - Production npm dependency audits: zero known vulnerabilities.
 - Android: `testDebugUnitTest`, `lintDebug`, and `assembleDebug` pass.

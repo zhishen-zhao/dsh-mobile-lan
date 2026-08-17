@@ -1,7 +1,7 @@
 {
   "name": "dsh-mobile-remote",
   "description": "Mobile remote-control companion app for dsh: a PWA served by the harness web server to chat with the agent and run SSH commands on the dsh-tool-ssh hosts from a phone",
-  "version": "0.7.2",
+  "version": "0.7.3",
   "type": "module",
   "main": "lib/index.js",
   "types": "lib/types/index.d.ts",
