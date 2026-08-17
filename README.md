@@ -269,3 +269,5 @@ $env:Path = "$env:JAVA_HOME\bin;$env:Path"
 ## License
 
 [MIT](LICENSE)
+
+图标原始图由 ChatGPT 图像生成功能产出并由项目维护者选定。本项目并非 DeepSeek、OpenAI 或 ChatGPT 官方项目；商标与图像权利以及版权/商标异议处理方式见[图像、商标与移除声明](NOTICE.md)。经合理核验的权利人请求，相关内容可注明来源、替换或删除。

@@ -264,3 +264,5 @@ Current verified baseline:
 ## License
 
 [MIT](LICENSE)
+
+The icon source artwork was generated with ChatGPT's image-generation feature and selected by the project maintainer. This is not an official DeepSeek, OpenAI, or ChatGPT project. See the [artwork, trademark, and removal notice](NOTICE.md) for rights information and the process for reasonably verifiable attribution, replacement, or removal requests.
