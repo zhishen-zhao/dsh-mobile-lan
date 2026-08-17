@@ -18,7 +18,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          unzip -q dsh-mobile-lan-source.zip -d .
+          unzip -oq dsh-mobile-lan-source.zip -d .
           rm -f dsh-mobile-lan-source.zip .github/workflows/dsh-bootstrap.yml
       - name: Publish source tree
         shell: bash
