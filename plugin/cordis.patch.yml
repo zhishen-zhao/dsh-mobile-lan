@@ -1,0 +1,40 @@
+# dsh-mobile-remote bundle patch: adds the mobile remote-control app row to the
+# host plane of the web profile. The row serves a PWA at `/mobile/` (open from a
+# phone on the same LAN) and exposes a token-guarded REST/SSE API at
+# `/mobile-api/` that proxies the host gateway in-process.
+#
+# The row is ENABLED by default: the app shell and its assets are public, but
+# every `/mobile-api/` endpoint answers 401 until `accessTokenEnv` names a
+# non-empty, high-entropy secret. The app requires HTTPS, pairs once, then
+# uses an HttpOnly same-site session cookie. Set it in the profile's own
+# `cordis.patch.yml`, e.g.:
+#
+#   - id: mobile-remote
+#     config:
+#       accessTokenEnv: DSH_MOBILE_PAIRING_TOKEN
+#       pairingServerUrl: https://192.168.1.10:3080
+#       sshAliases: [dev]         # 显式手机 SSH 范围;留空会禁用手机 SSH
+#
+# Requires the host-plane `webServer` and `apiProxy` services (present in the
+# shipped web profile). SSH execution reuses the `ssh` tool registered by
+# dsh-tool-ssh through the host tools registry — no credential duplication.
+
+- insert:
+    - id: mobile-remote
+      name: 'dsh-mobile-remote'
+      config:
+        accessToken: ''
+        accessTokenEnv: ''
+        allowInlineAccessToken: false
+        pairingServerUrl: ''
+        localPairingQrTtlMs: 300000
+        title: 'DSH 远程控制'
+        sshAliases: []
+        allowExistingSessions: false
+        workspaceIds: []
+        allowWorkspaceSelection: true
+        maxHistoryMessages: 80
+        maxPromptBytes: 8192
+        maxSshTimeoutMs: 300000
+        sessionTtlMs: 604800000
+        requireSecureTransport: true

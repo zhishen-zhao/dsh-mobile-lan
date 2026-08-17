@@ -1,0 +1,40 @@
+# dsh-tool-ssh bundle patch: adds the model-facing SSH tool row to the host
+# plane, alongside the other tool rows the base bundle mounts. The row ships
+# DISABLED with an empty host list: running commands on remote machines is a
+# capability the operator grants per profile, so enable it and name the hosts
+# in the profile's own `cordis.patch.yml` (applied after this layer), e.g.:
+#
+#   - id: tool-ssh
+#     disabled: false
+#     config:
+#       hosts:
+#         dev:
+#           host: dev.example.com
+#           port: 22
+#           username: deploy
+#           auth:
+#             type: key
+#             privateKeyPath: C:/Users/you/.ssh/id_ed25519
+#           knownHostFingerprint: SHA256:…
+#           allowedCommands: ["uptime", "df -h"]
+#
+# The tool registers into the host `tools` registry and provides no service of
+# its own, so — like `tool-fs` and the other tool rows — it needs no isolate
+# realm and stays visible to every agent composed over this profile.
+
+- insert:
+    - id: tool-ssh
+      name: 'dsh-tool-ssh'
+      disabled: true
+      config:
+        hosts: {}
+        requireHostKeyVerification: true
+        allowInlineSecrets: false
+        defaultTimeoutMs: 60000
+        maxTimeoutMs: 300000
+        backgroundTimeoutMs: 900000
+        maxBackgroundTimeoutMs: 3600000
+        connectTimeoutMs: 30000
+        maxOutputBytes: 262144
+        maxCommandBytes: 16384
+        enableRunInBackground: true

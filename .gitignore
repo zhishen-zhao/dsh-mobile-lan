@@ -1,0 +1,25 @@
+# JavaScript
+**/node_modules/
+**/*.tgz
+
+# Android / Gradle / IDE
+android/.gradle/
+android/.kotlin/
+android/.idea/
+android/build/
+android/app/build/
+android/local.properties
+**/*.iml
+
+# Per-installation TLS material (never commit)
+certs/
+android/app/src/main/res/raw/dsh_mobile_local_ca.pem
+
+# Local artifacts
+*.apk
+*.aab
+*.jks
+*.keystore
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component: [plugin, optional/dsh-tool-ssh]
+    defaults:
+      run:
+        working-directory: ${{ matrix.component }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: ${{ matrix.component }}/package-lock.json
+      - run: npm ci
+      - run: node test/smoke.mjs
+      - run: npm audit --omit=dev
+      - run: npm pack --dry-run
+
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+      - uses: android-actions/setup-android@v3
+      - name: Generate CI-only TLS identity
+        shell: pwsh
+        run: ./scripts/setup-local-tls.ps1 -HostName 192.0.2.10
+      - run: chmod +x android/gradlew
+      - name: Test, lint and build
+        working-directory: android
+        run: ./gradlew testDebugUnitTest lintDebug assembleDebug
