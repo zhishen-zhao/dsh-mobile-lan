@@ -38,5 +38,7 @@
     <div id="confirm-layer" class="modal-layer hidden" aria-hidden="true"><section class="confirm-dialog" role="alertdialog" aria-modal="true" aria-labelledby="confirm-title"><h2 id="confirm-title">启用完全访问？</h2><p>完全访问会取消文件系统沙箱，并允许操作不再逐项询问。只应在你信任当前任务和工作区时启用。</p><label class="confirm-check"><input id="confirm-checkbox" type="checkbox"> 我了解此设置会扩大手机远程操作的权限</label><div class="confirm-actions"><button id="btn-confirm-cancel" class="secondary">取消</button><button id="btn-confirm-danger" class="danger" disabled>启用完全访问</button></div></section></div>
   </div>
   <div id="login" class="login"><div class="login-card"><h1>DSH 远程控制</h1><p class="muted">请从电脑上的配对页扫码连接</p><input id="login-token" type="password" placeholder="配对码" autocomplete="current-password"><button id="btn-login" class="primary full">连接</button><p id="login-error" class="error hidden"></p></div></div><div id="toast" class="toast hidden"></div><script src="/mobile/app.js" type="module"></script>
+  <input id="image-input" class="visually-hidden" type="file" accept="image/png,image/jpeg,image/webp,image/gif" multiple>
+  <div id="image-draft" class="image-draft hidden" aria-label="待发送图片"></div>
 </body>
 </html>

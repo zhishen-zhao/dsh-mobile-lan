@@ -18,8 +18,11 @@ Bring a restricted [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-ha
 - Up-to-seven-day HttpOnly device session, revoked early on logout or Harness restart.
 - Session drawer, workspace grouping, optional desktop-session visibility, and a default workspace selector.
 - GFM Markdown, tables, blockquotes, task lists, code blocks, compact links, message copy, and conversation forks.
+- Multimodal image messages from the `+` menu: PNG/JPEG/WebP/GIF preview, removal, image-only prompts, and historical image rendering; the selected Harness model must declare `image` input support.
 - Animation-frame live responses, reasoning, context injections, and collapsible tool/command timelines.
+- Message actions stay collapsed until a completed message is tapped; reasoning and streaming output do not automatically show copy controls.
 - Sending/delivered feedback, model work phases, elapsed processing time, completion notifications, and approval reminders.
+- Structured `ask_user_question` answers, Plan review, tool approvals, and live queue-state convergence after mutations.
 - Running-turn queue editing, deletion, single-message steering, and steer-all.
 - Permission preset, agent preset, model, and reasoning-effort controls.
 - Light, dark, and system appearance modes.
@@ -48,8 +51,8 @@ Read [the repository security policy](SECURITY.md), [the mobile plugin threat mo
 
 | Path | Purpose |
 | --- | --- |
-| `plugin/` | `dsh-mobile-remote` Cordis plugin, PWA, TLS proxy, and 43 smoke tests. |
-| `android/` | Android 1.6 QR launcher and restricted WebView client. |
+| `plugin/` | `dsh-mobile-remote` Cordis plugin, PWA, TLS proxy, and 46 smoke tests. |
+| `android/` | Android 1.7 QR launcher, system image picker, and restricted WebView client. |
 | `optional/dsh-tool-ssh/` | Optional SSH tool and 21 loopback SSH tests. |
 | `docs/branding/` | App icon source, generated master, and launcher-mask preview. |
 | `scripts/setup-local-tls.ps1` | Creates the CA once, then reuses it while refreshing the current server identity. |
@@ -257,7 +260,7 @@ $env:Path = "$env:JAVA_HOME\bin;$env:Path"
 
 Current verified baseline:
 
-- `dsh-mobile-remote 0.8.1`: 43 smoke checks.
+- `dsh-mobile-remote 0.9.0`: 46 smoke checks, including image attachments, interaction responses, optimistic queue updates, and collapsed message actions.
 - `dsh-tool-ssh 0.2.0`: 21 loopback SSH checks.
 - Production npm dependency audits: zero known vulnerabilities.
 - Android: `testDebugUnitTest`, `lintDebug`, and `assembleDebug` pass.

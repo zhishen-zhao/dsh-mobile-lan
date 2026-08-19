@@ -15,6 +15,7 @@ import android.view.WindowManager
 import android.webkit.CookieManager
 import android.webkit.ConsoleMessage
 import android.webkit.SslErrorHandler
+import android.webkit.ValueCallback
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
@@ -29,6 +30,7 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
+import androidx.activity.result.contract.ActivityResultContracts
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** The only post-pairing surface: a native View hierarchy hosting the audited PWA. */
@@ -42,6 +44,12 @@ class RemoteActivity : ComponentActivity() {
     private lateinit var errorMessage: TextView
     private var firstFrameVisible = false
     private var session: PairedSession? = null
+    private var fileChooserCallback: ValueCallback<Array<Uri>>? = null
+
+    private val imagePicker = registerForActivityResult(ActivityResultContracts.GetMultipleContents()) { uris ->
+        fileChooserCallback?.onReceiveValue(uris.toTypedArray())
+        fileChooserCallback = null
+    }
 
     private val loadTimeout = Runnable {
         if (!firstFrameVisible && !closing.get()) showError("页面首帧渲染超时。请确认电脑在线，并点击重试。")
@@ -72,6 +80,8 @@ class RemoteActivity : ComponentActivity() {
 
     override fun onDestroy() {
         mainHandler.removeCallbacks(loadTimeout)
+        fileChooserCallback?.onReceiveValue(null)
+        fileChooserCallback = null
         if (::webView.isInitialized) {
             webView.stopLoading()
             webView.webChromeClient = null
@@ -137,6 +147,17 @@ class RemoteActivity : ComponentActivity() {
         }
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, false)
         webView.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(
+                webView: WebView,
+                filePathCallback: ValueCallback<Array<Uri>>,
+                fileChooserParams: FileChooserParams,
+            ): Boolean {
+                fileChooserCallback?.onReceiveValue(null)
+                fileChooserCallback = filePathCallback
+                imagePicker.launch("image/*")
+                return true
+            }
+
             override fun onConsoleMessage(message: ConsoleMessage): Boolean {
                 android.util.Log.d("DSHMobileWeb", "${message.message()} @${message.sourceId()}:${message.lineNumber()}")
                 return true

@@ -3,6 +3,8 @@
 A **single-user** dsh remote-control PWA. The Harness stays on the local machine; a paired phone opens `/mobile/` over HTTPS and can install it as an app-like home-screen experience.
 
 - Chat through mobile-created sessions. Desktop sessions are hidden by default.
+- Multimodal image prompts from the composer `+` menu, with local preview and scoped historical attachment loading. The selected Harness model must declare image input support.
+- Structured user-question answers, Plan review, tool approvals, optimistic queue updates, and collapsed message actions.
 - Reuse the optional [dsh-tool-ssh](../optional/dsh-tool-ssh) without copying credentials. Phone SSH is limited to explicitly configured aliases and follows the SSH tool's policy.
 - A one-time pairing code is submitted to `/mobile-api/login`; the app then uses an up-to-7-day `HttpOnly`, `SameSite=Strict` device session. Android encrypts the short-lived session with Android Keystore. The long-lived root secret is never stored in browser storage, a URL, or the app.
 - HTTPS is required for transport protection and PWA installation. The bundled LAN proxy terminates TLS while the Harness remains loopback-only.
@@ -59,7 +61,7 @@ HTTPS protects web traffic from reading and modification in transit, and service
 
 ## API
 
-`POST /mobile-api/login` accepts `{token}` and creates the cookie session. Authenticated endpoints include session state/history, queue editing and steering, message forks, permission/model/preset controls, SSH, SSE events, and logout. URL query tokens are not supported. Default scope permits only mobile-created sessions.
+`POST /mobile-api/login` accepts `{token}` and creates the cookie session. Authenticated endpoints include session state/history, queue editing and steering, message forks, multimodal prompts and scoped attachments, question/approval responses, permission/model/preset controls, SSH, SSE events, and logout. URL query tokens are not supported. Default scope permits only mobile-created sessions.
 
 ## Development
 

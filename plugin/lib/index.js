@@ -155,7 +155,7 @@ const SECURITY_HEADERS = {
 	"x-frame-options": "DENY",
 	"referrer-policy": "no-referrer",
 	"permissions-policy": "camera=(), geolocation=(), microphone=()",
-	"content-security-policy": "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self'; script-src 'self'; style-src 'self'"
+	"content-security-policy": "default-src 'self'; base-uri 'none'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'; img-src 'self' blob:; script-src 'self'; style-src 'self'"
 };
 
 const MOBILE_COMMANDS = Object.freeze([
@@ -167,6 +167,23 @@ const MOBILE_COMMANDS = Object.freeze([
 	{ name: "plan", description: "进入或退出计划模式", action: "insert", hint: "<on|off>" },
 	{ name: "model", description: "选择本会话使用的模型", action: "model" }
 ]);
+
+const MOBILE_IMAGE_MEDIA_TYPES = new Set(["image/png", "image/jpeg", "image/webp", "image/gif"]);
+const MOBILE_MAX_IMAGES_PER_MESSAGE = 4;
+const MOBILE_MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+const MOBILE_MAX_MESSAGE_IMAGE_BYTES = 16 * 1024 * 1024;
+const MOBILE_MAX_PROMPT_BODY_BYTES = 24 * 1024 * 1024;
+
+function mobileImagePart(value) {
+	if (value === null || typeof value !== "object" || value.type !== "image") throw new Error("image entry is invalid");
+	if (!MOBILE_IMAGE_MEDIA_TYPES.has(value.mediaType)) throw new Error("image type must be PNG, JPEG, WebP, or GIF");
+	if (typeof value.data !== "string" || value.data.length === 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(value.data) || value.data.length % 4 !== 0) throw new Error("image data must be canonical base64");
+	const bytes = Buffer.from(value.data, "base64");
+	if (bytes.length === 0 || bytes.toString("base64") !== value.data) throw new Error("image data must be canonical base64");
+	if (bytes.length > MOBILE_MAX_IMAGE_BYTES) throw new Error(`each image must be at most ${MOBILE_MAX_IMAGE_BYTES} bytes`);
+	if (value.name !== void 0 && (typeof value.name !== "string" || value.name.length === 0 || Buffer.byteLength(value.name, "utf8") > 255)) throw new Error("image name is invalid");
+	return { part: { type: "image", mediaType: value.mediaType, data: value.data, ...(value.name === void 0 ? {} : { name: value.name }) }, bytes: bytes.length };
+}
 
 function withSecurityHeaders(headers = {}) {
 	return { ...SECURITY_HEADERS, ...headers };
@@ -350,7 +367,7 @@ function apply(ctx, config = {}) {
 	const runtimeFor = (sessionId) => {
 		let runtime = sessionRuntime.get(sessionId);
 		if (runtime === void 0) {
-			runtime = { queueLength: 0, queueItems: [], activeTool: void 0, jobs: 0, pendingApproval: void 0, lastCompletedAt: void 0 };
+			runtime = { queueLength: 0, queueItems: [], activeTool: void 0, jobs: 0, pendingApproval: void 0, pendingQuestion: void 0, lastCompletedAt: void 0 };
 			sessionRuntime.set(sessionId, runtime);
 		}
 		return runtime;
@@ -444,7 +461,7 @@ function apply(ctx, config = {}) {
 				}, muxAbort.signal)) {
 					const sessionId = frame.payload?.sessionId;
 					if (!allowExistingSessions && (typeof sessionId !== "string" || !mobileSessions.has(sessionId))) continue;
-					observeRuntimeFrame(frame.payload);
+					observeRuntimeFrame(frame.payload, frame.rpcId);
 					const line = `data: ${JSON.stringify({ type: "server-request", rpcId: frame.rpcId, method: frame.payload?.type, payload: frame.payload })}\n\n`;
 					for (const [client, expiresAt] of clients) {
 						if (expiresAt <= Date.now()) {
@@ -576,7 +593,7 @@ function apply(ctx, config = {}) {
 		return visibleWorkspaces(req);
 	};
 
-	const observeRuntimeFrame = (payload) => {
+	const observeRuntimeFrame = (payload, rpcId) => {
 		const sessionId = payload?.sessionId;
 		if (typeof sessionId !== "string" || !sessionAllowed(sessionId)) return;
 		const runtime = runtimeFor(sessionId);
@@ -586,9 +603,16 @@ function apply(ctx, config = {}) {
 		} else if (payload.type === "session/jobs") {
 			runtime.jobs = Array.isArray(payload.jobs) ? payload.jobs.length : 0;
 		} else if (payload.type === "approval/requested") {
-			runtime.pendingApproval = { toolName: payload.toolName, reason: payload.reason };
+			runtime.pendingApproval = { rpcId, approvalId: payload.approvalId, toolName: payload.toolName, reason: payload.reason };
 		} else if (payload.type === "approval/resolved") {
 			runtime.pendingApproval = void 0;
+		} else if (payload.type === "question/requested") {
+			runtime.pendingQuestion = { rpcId, questions: Array.isArray(payload.questions) ? payload.questions : [] };
+		} else if (payload.type === "question/resolved") {
+			runtime.pendingQuestion = void 0;
+		} else if (payload.type === "session/projection") {
+			runtime.projections ??= {};
+			runtime.projections[payload.key] = payload.value;
 		} else if (payload.type === "session/event") {
 			const event = payload.event;
 			if (event?.type === "tool/call") runtime.activeTool = typeof event.data?.name === "string" ? event.data.name : "工具";
@@ -609,7 +633,7 @@ function apply(ctx, config = {}) {
 		let body = {};
 		if (req.method === "POST") {
 			try {
-				body = await readJsonBody(req);
+				body = await readJsonBody(req, path === "/prompt" ? MOBILE_MAX_PROMPT_BODY_BYTES : 1 << 20);
 			} catch (error) {
 				return sendJson(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) });
 			}
@@ -649,6 +673,8 @@ function apply(ctx, config = {}) {
 					parentSessionId: item.parentSessionId,
 					origin: item.origin,
 					title: item.projections?.values?.title ?? void 0,
+					plan: item.projections?.values?.plan ?? void 0,
+					imageLimits: item.projections?.values?.imageLimits ?? void 0,
 					activity: runtimeFor(item.sessionId)
 				}));
 				return sendJson(res, 200, {
@@ -678,15 +704,81 @@ function apply(ctx, config = {}) {
 				return sendJson(res, 200, { ok: true, sessionId: created.sessionId, agentPreset: created.agentPreset, workspaceId: workspace.defaultWorkspaceId });
 			}
 			if (req.method === "POST" && path === "/prompt") {
-				if (typeof body.sessionId !== "string" || typeof body.text !== "string" || body.text.trim().length === 0) return sendJson(res, 400, { ok: false, error: "prompt needs sessionId and non-empty text" });
-				if (!sessionAllowed(body.sessionId)) return sendJson(res, 403, { ok: false, error: "session is outside the mobile-app scope" });
-				if (Buffer.byteLength(body.text, "utf8") > maxPromptBytes) return sendJson(res, 400, { ok: false, error: `prompt exceeds the ${maxPromptBytes}-byte limit` });
-				const accepted = await call(ctx.apiProxy.sessions.prompt, {
-					sessionId: body.sessionId,
-					mode: "queue",
-					content: [{ type: "text", text: body.text }]
-				});
-				return sendJson(res, 200, { ok: true, accepted: accepted.accepted === true });
+				const sessionId = requireMobileSession(body.sessionId);
+				if (typeof body.text !== "string") return sendJson(res, 400, { ok: false, error: "prompt text must be a string" });
+				if (Buffer.byteLength(body.text, "utf8") > maxPromptBytes) return sendJson(res, 400, { ok: false, error: `prompt exceeds the ${maxPromptBytes}-byte text limit` });
+				if (body.images !== void 0 && !Array.isArray(body.images)) return sendJson(res, 400, { ok: false, error: "images must be an array" });
+				const images = Array.isArray(body.images) ? body.images : [];
+				if (images.length > MOBILE_MAX_IMAGES_PER_MESSAGE) return sendJson(res, 400, { ok: false, error: `a message can contain at most ${MOBILE_MAX_IMAGES_PER_MESSAGE} images` });
+				let totalImageBytes = 0;
+				let imageParts;
+				try {
+					imageParts = images.map((image) => {
+						const parsed = mobileImagePart(image);
+						totalImageBytes += parsed.bytes;
+						return parsed.part;
+					});
+				} catch (error) {
+					return sendJson(res, 400, { ok: false, error: error instanceof Error ? error.message : String(error) });
+				}
+				if (totalImageBytes > MOBILE_MAX_MESSAGE_IMAGE_BYTES) return sendJson(res, 400, { ok: false, error: `message images must total at most ${MOBILE_MAX_MESSAGE_IMAGE_BYTES} bytes` });
+				const text = body.text.trim();
+				if (text.length === 0 && imageParts.length === 0) return sendJson(res, 400, { ok: false, error: "prompt needs text or at least one image" });
+				try {
+					const accepted = await call(ctx.apiProxy.sessions.prompt, {
+						sessionId,
+						mode: "queue",
+						content: [...imageParts, ...(text.length === 0 ? [] : [{ type: "text", text }])]
+					});
+					return sendJson(res, 200, { ok: true, accepted: accepted.accepted === true });
+				} catch (error) {
+					if (error?.code === "attachment-error") return sendJson(res, 400, { ok: false, error: error.message });
+					throw error;
+				}
+			}
+			if (req.method === "POST" && path === "/respond") {
+				const sessionId = requireMobileSession(body.sessionId);
+				if (typeof body.rpcId !== "string" || body.rpcId.length === 0 || body.rpcId.length > 256) return sendJson(res, 400, { ok: false, error: "rpcId is invalid" });
+				const runtime = runtimeFor(sessionId);
+				let message;
+				if (body.kind === "question") {
+					if (runtime.pendingQuestion?.rpcId !== body.rpcId) return sendJson(res, 409, { ok: false, error: "question is no longer pending" });
+					if (body.cancel === true) message = { type: "client-response", rpcId: body.rpcId, result: { ok: false, error: { code: "cancelled", message: "the user closed this question request", details: {} } } };
+					else {
+						if (!Array.isArray(body.answers)) return sendJson(res, 400, { ok: false, error: "question answers must be an array" });
+						const questions = runtime.pendingQuestion.questions;
+						if (body.answers.length !== questions.length) return sendJson(res, 400, { ok: false, error: "every question must have an answer" });
+						const answers = [];
+						for (const answer of body.answers) {
+							const question = questions.find((item) => item?.id === answer?.id);
+							if (question === void 0 || !Array.isArray(answer.selected) || answer.selected.some((label) => typeof label !== "string" || !(question.options ?? []).some((option) => option?.label === label))) return sendJson(res, 400, { ok: false, error: "question answer is invalid" });
+							if (question.multiSelect !== true && answer.selected.length > 1) return sendJson(res, 400, { ok: false, error: "question allows only one selected option" });
+							if (answer.custom !== void 0 && (typeof answer.custom !== "string" || Buffer.byteLength(answer.custom, "utf8") > maxPromptBytes)) return sendJson(res, 400, { ok: false, error: "custom answer is invalid" });
+							answers.push({ id: question.id, selected: answer.selected, ...(typeof answer.custom === "string" && answer.custom.trim() ? { custom: answer.custom.trim() } : {}) });
+						}
+						message = { type: "client-response", rpcId: body.rpcId, result: { ok: true, value: { sessionId, answer: { answers } } } };
+					}
+				} else if (body.kind === "approval") {
+					const pending = runtime.pendingApproval;
+					if (pending?.rpcId !== body.rpcId) return sendJson(res, 409, { ok: false, error: "approval is no longer pending" });
+					if (body.outcome !== "allowed-once" && body.outcome !== "rejected") return sendJson(res, 400, { ok: false, error: "approval outcome is invalid" });
+					message = { type: "client-response", rpcId: body.rpcId, result: { ok: true, value: { sessionId, approvalId: pending.approvalId, outcome: body.outcome } } };
+				} else return sendJson(res, 400, { ok: false, error: "response kind must be question or approval" });
+				const receipt = await ctx.apiProxy.respond(message);
+				if (receipt?.accepted !== true) return sendJson(res, 409, { ok: false, error: `response was rejected (${receipt?.reason ?? "unknown"})` });
+				return sendJson(res, 200, { ok: true, accepted: true });
+			}
+			if (req.method === "GET" && path === "/attachment") {
+				const sessionId = requireMobileSession(url.searchParams.get("sessionId"));
+				const attachmentId = url.searchParams.get("attachmentId");
+				if (typeof attachmentId !== "string" || attachmentId.length === 0 || attachmentId.length > 256) return sendJson(res, 400, { ok: false, error: "attachmentId is invalid" });
+				const result = await call(ctx.apiProxy.sessions.attachment, { sessionId, attachmentId });
+				const mediaType = result?.attachment?.mediaType;
+				if (!MOBILE_IMAGE_MEDIA_TYPES.has(mediaType) || typeof result.data !== "string") return sendJson(res, 502, { ok: false, error: "attachment response is invalid" });
+				const bytes = Buffer.from(result.data, "base64");
+				res.writeHead(200, withSecurityHeaders({ "content-type": mediaType, "content-length": bytes.length, "cache-control": "private, max-age=3600" }));
+				res.end(bytes);
+				return;
 			}
 			if (req.method === "GET" && path === "/session-controls") {
 				const sessionId = requireMobileSession(url.searchParams.get("sessionId"));

@@ -4,6 +4,8 @@
 运行，手机通过 HTTPS 打开 `/mobile/`；安装到主屏幕后，它以独立 App 外壳运行。
 
 - **聊天**：创建、继续、停止手机 App 自己的会话。默认看不到桌面已有会话。
+- **多模态**：通过输入框左下角 `+` 选择 PNG/JPEG/WebP/GIF，支持预览、移除、仅图片消息和历史图片；所选 Harness 模型必须声明支持 `image` 输入。
+- **交互**：提问选项、Plan 审核、工具许可和运行中队列均通过受限接口实时同步；已完成消息的复制/分支操作默认收起，点击消息后显示。
 - **SSH**：复用可选的 [dsh-tool-ssh](../optional/dsh-tool-ssh) 的凭据和命令策略；手机端只可用
   profile 中明确列出的别名。
 - **配对**：电脑本机的 `/mobile-pair` 页面显示短时、一次性二维码；App 扫码后才向
@@ -123,6 +125,8 @@ IPv4 重签服务证书、重启代理并更新动态端点文件。以下是手
 | `POST /mobile-api/workspace` | `{workspaceId}` 或 `{workspaceId:null}`，更新本次手机连接中新会话的默认工作区。 |
 | `POST /mobile-api/create-session` | 创建并登记为手机会话。 |
 | `POST /mobile-api/prompt` / `cancel` | 仅操作手机范围内的 `sessionId`。 |
+| `POST /mobile-api/respond` | 回传当前会话仍待处理的提问或工具许可；服务端校验 `rpcId`，不接受过期请求。 |
+| `GET /mobile-api/attachment?sessionId=&attachmentId=` | 在会话范围内读取已持久化的图片附件。 |
 | `GET /mobile-api/history?sessionId=` | 仅返回手机范围内的会话历史。 |
 | `GET /mobile-api/session-controls?sessionId=` | 返回该会话可用的权限预设、Agent 模式、模型与受限命令目录。 |
 | `POST /mobile-api/queue` | 编辑、删除或把一条仍在排队的文本消息严格插话到当前轮次。 |

@@ -38,6 +38,7 @@ let workingTool = null;
 let workingTicker = null;
 let pendingDangerPreset = null;
 let queueExpanded = false;
+let imageDrafts = [];
 let connection = { phase: "connecting", latencyMs: null, detail: "正在连接 Harness…" };
 const expandedGroups = new Set();
 
@@ -47,6 +48,62 @@ function toast(message) {
   el.classList.remove("hidden");
   clearTimeout(toast.timer);
   toast.timer = setTimeout(() => el.classList.add("hidden"), 3200);
+}
+
+function renderImageDrafts() {
+  const container = $("image-draft");
+  if (container === null) return;
+  container.innerHTML = "";
+  container.classList.toggle("hidden", imageDrafts.length === 0);
+  for (const [index, draft] of imageDrafts.entries()) {
+    const item = document.createElement("div");
+    item.className = "image-draft-item";
+    const image = document.createElement("img");
+    image.src = draft.url;
+    image.alt = draft.file.name;
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.className = "image-remove";
+    remove.textContent = "×";
+    remove.setAttribute("aria-label", `移除图片 ${index + 1}`);
+    remove.addEventListener("click", () => { URL.revokeObjectURL(draft.url); imageDrafts.splice(index, 1); renderImageDrafts(); syncComposer(); });
+    item.append(image, remove);
+    container.appendChild(item);
+  }
+}
+
+function selectImages(files) {
+  const accepted = [...files].filter((file) => ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(file.type) && file.size <= 5 * 1024 * 1024);
+  if (accepted.length !== files.length) toast("仅支持 PNG、JPEG、WebP、GIF 图片");
+  if (imageDrafts.length + accepted.length > 4) return toast("每条消息最多添加 4 张图片");
+  if ([...imageDrafts.map((item) => item.file), ...accepted].reduce((sum, file) => sum + file.size, 0) > 16 * 1024 * 1024) return toast("每条消息的图片总计不能超过 16 MiB");
+  for (const file of accepted) imageDrafts.push({ file, url: URL.createObjectURL(file) });
+  renderImageDrafts();
+  syncComposer();
+}
+
+function fileAsBase64(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result).split(",", 2)[1] ?? "");
+    reader.onerror = () => reject(new Error("图片读取失败"));
+    reader.readAsDataURL(file);
+  });
+}
+
+function renderMessageImages(box, content) {
+  if (!Array.isArray(content)) return;
+  for (const block of content) {
+    if (block?.type !== "image") continue;
+    const attachmentId = block.attachment?.attachmentId;
+    if (typeof attachmentId !== "string" || currentSessionId === null) continue;
+    const image = document.createElement("img");
+    image.className = "message-image";
+    image.alt = block.attachment?.name ?? "消息图片";
+    image.loading = "lazy";
+    image.src = `/mobile-api/attachment?sessionId=${encodeURIComponent(currentSessionId)}&attachmentId=${encodeURIComponent(attachmentId)}`;
+    box.appendChild(image);
+  }
 }
 
 function setConnection(phase, detail, latencyMs = null) {
@@ -311,6 +368,7 @@ function renderActivity(summary) {
     text.textContent = `等待许可批准：${approval.toolName ?? "工具"}${approval.reason ? `（${approval.reason}）` : ""}`;
     banner.classList.add("approval");
     banner.classList.remove("hidden");
+    renderInteraction(summary);
     return;
   }
   const parts = [];
@@ -327,6 +385,126 @@ function renderActivity(summary) {
   if (parts.length === 0) banner.classList.add("hidden");
   else { text.textContent = parts.join(" · "); banner.classList.remove("hidden"); }
   if ((activity?.lastCompletedAt ?? 0) > lastCompletionAt) { lastCompletionAt = activity.lastCompletedAt; toast("任务已完成"); }
+  renderInteraction(summary);
+}
+
+function ensureInteractionDock() {
+  let dock = $("interaction-dock");
+  if (dock !== null) return dock;
+  dock = document.createElement("section");
+  dock.id = "interaction-dock";
+  dock.className = "interaction-dock hidden";
+  dock.setAttribute("aria-live", "polite");
+  $("composer-form").before(dock);
+  return dock;
+}
+
+async function respondInteraction(body) {
+  const dock = ensureInteractionDock();
+  dock.classList.add("submitting");
+  try {
+    await api("/respond", { method: "POST", body: { sessionId: currentSessionId, ...body } });
+    dock.classList.add("hidden");
+    toast("已提交");
+  } catch (error) { toast(String(error.message ?? error)); }
+  finally { dock.classList.remove("submitting"); }
+}
+
+function renderInteraction(summary = currentSummary()) {
+  const dock = ensureInteractionDock();
+  const activity = summary?.activity;
+  const questionWait = activity?.pendingQuestion;
+  const approvalWait = activity?.pendingApproval;
+  dock.innerHTML = "";
+  dock.classList.toggle("hidden", questionWait === undefined && approvalWait === undefined);
+  if (questionWait !== undefined) {
+    const questions = Array.isArray(questionWait.questions) ? questionWait.questions : [];
+    const planQuestion = questions.length === 1 && questions[0]?.intent?.kind === "plan-review" ? questions[0] : null;
+    const head = document.createElement("div");
+    head.className = "interaction-head";
+    head.innerHTML = `<strong>${planQuestion ? "计划等待确认" : "模型需要你的回答"}</strong><span>${questions.length} 项</span>`;
+    dock.appendChild(head);
+    const form = document.createElement("form");
+    form.className = "interaction-form";
+    if (planQuestion !== null) {
+      const detail = document.createElement("div");
+      detail.className = "interaction-markdown";
+      appendMarkdown(detail, planQuestion.detail ?? "");
+      const feedback = document.createElement("textarea");
+      feedback.rows = 2;
+      feedback.placeholder = "需要调整时，可填写反馈";
+      const actions = document.createElement("div");
+      actions.className = "interaction-actions";
+      const decline = document.createElement("button");
+      decline.type = "button";
+      decline.className = "secondary";
+      decline.textContent = "继续规划";
+      const approve = document.createElement("button");
+      approve.type = "button";
+      approve.className = "primary";
+      approve.textContent = "确认执行";
+      const approveLabel = planQuestion.intent.approve;
+      const declineLabel = (planQuestion.options ?? []).find((option) => option.label !== approveLabel)?.label ?? "继续规划";
+      decline.addEventListener("click", () => respondInteraction({ kind: "question", rpcId: questionWait.rpcId, answers: [{ id: planQuestion.id, selected: [declineLabel], ...(feedback.value.trim() ? { custom: feedback.value.trim() } : {}) }] }));
+      approve.addEventListener("click", () => respondInteraction({ kind: "question", rpcId: questionWait.rpcId, answers: [{ id: planQuestion.id, selected: [approveLabel] }] }));
+      actions.append(decline, approve);
+      form.append(detail, feedback, actions);
+    } else {
+      for (const question of questions) {
+        const field = document.createElement("fieldset");
+        field.dataset.questionId = question.id;
+        const legend = document.createElement("legend");
+        legend.textContent = question.header ? `${question.header} · ${question.question}` : question.question;
+        field.appendChild(legend);
+        if (question.detail) { const detail = document.createElement("p"); detail.className = "interaction-detail"; detail.textContent = question.detail; field.appendChild(detail); }
+        for (const option of question.options ?? []) {
+          const label = document.createElement("label");
+          label.className = "question-option";
+          const input = document.createElement("input");
+          input.type = question.multiSelect === true ? "checkbox" : "radio";
+          input.name = `question-${question.id}`;
+          input.value = option.label;
+          const copy = document.createElement("span");
+          copy.innerHTML = `<strong></strong><small></small>`;
+          copy.querySelector("strong").textContent = option.label;
+          copy.querySelector("small").textContent = option.description ?? "";
+          label.append(input, copy);
+          field.appendChild(label);
+        }
+        const custom = document.createElement("textarea");
+        custom.className = "question-custom";
+        custom.rows = 2;
+        custom.placeholder = "其他回答（可选）";
+        field.appendChild(custom);
+        form.appendChild(field);
+      }
+      const actions = document.createElement("div");
+      actions.className = "interaction-actions";
+      const cancel = document.createElement("button"); cancel.type = "button"; cancel.className = "secondary"; cancel.textContent = "取消";
+      const submit = document.createElement("button"); submit.type = "submit"; submit.className = "primary"; submit.textContent = "提交回答";
+      cancel.addEventListener("click", () => respondInteraction({ kind: "question", rpcId: questionWait.rpcId, cancel: true }));
+      actions.append(cancel, submit);
+      form.appendChild(actions);
+      form.addEventListener("submit", (event) => {
+        event.preventDefault();
+        const answers = questions.map((question) => {
+          const field = form.querySelector(`[data-question-id="${CSS.escape(question.id)}"]`);
+          return { id: question.id, selected: [...field.querySelectorAll("input:checked")].map((input) => input.value), ...(field.querySelector(".question-custom").value.trim() ? { custom: field.querySelector(".question-custom").value.trim() } : {}) };
+        });
+        void respondInteraction({ kind: "question", rpcId: questionWait.rpcId, answers });
+      });
+    }
+    dock.appendChild(form);
+  } else if (approvalWait !== undefined) {
+    const head = document.createElement("div"); head.className = "interaction-head"; head.innerHTML = `<strong>等待许可批准</strong><span>${approvalWait.toolName ?? "工具"}</span>`;
+    const reason = document.createElement("p"); reason.className = "interaction-detail"; reason.textContent = approvalWait.reason ?? "模型请求执行一项需要确认的操作。";
+    const actions = document.createElement("div"); actions.className = "interaction-actions";
+    const reject = document.createElement("button"); reject.className = "secondary"; reject.type = "button"; reject.textContent = "拒绝";
+    const allow = document.createElement("button"); allow.className = "primary"; allow.type = "button"; allow.textContent = "允许一次";
+    reject.addEventListener("click", () => respondInteraction({ kind: "approval", rpcId: approvalWait.rpcId, outcome: "rejected" }));
+    allow.addEventListener("click", () => respondInteraction({ kind: "approval", rpcId: approvalWait.rpcId, outcome: "allowed-once" }));
+    actions.append(reject, allow); dock.append(head, reason, actions);
+  }
 }
 
 function formatDuration(milliseconds) {
@@ -452,7 +630,7 @@ function syncComposer() {
   const input = $("input");
   const available = currentSessionId !== null && connection.phase !== "offline";
   input.disabled = !available;
-  $("btn-send").disabled = !available || input.value.trim().length === 0;
+  $("btn-send").disabled = !available || (input.value.trim().length === 0 && imageDrafts.length === 0);
   for (const id of ["btn-command-menu", "btn-permission", "btn-agent-preset", "btn-model"]) $(id).disabled = !available;
 }
 
@@ -756,7 +934,36 @@ function addMessageActions(box, text, { seq, canFork = false } = {}) {
     fork.addEventListener("click", () => forkFromMessage(seq));
     actions.appendChild(fork);
   }
+  box.classList.add("has-message-actions");
+  box.tabIndex = 0;
+  box.setAttribute("aria-expanded", "false");
+  const toggleActions = (event) => {
+    if (event.target.closest("a, button, input, textarea, select, summary, details")) return;
+    const visible = !box.classList.contains("actions-visible");
+    for (const message of document.querySelectorAll(".msg.actions-visible")) {
+      if (message !== box) {
+        message.classList.remove("actions-visible");
+        message.setAttribute("aria-expanded", "false");
+      }
+    }
+    box.classList.toggle("actions-visible", visible);
+    box.setAttribute("aria-expanded", String(visible));
+  };
+  box.addEventListener("click", toggleActions);
+  box.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" && event.key !== " ") return;
+    event.preventDefault();
+    toggleActions(event);
+  });
   box.appendChild(actions);
+}
+
+function closeMessageActions(except = null) {
+  for (const message of document.querySelectorAll(".msg.actions-visible")) {
+    if (message === except) continue;
+    message.classList.remove("actions-visible");
+    message.setAttribute("aria-expanded", "false");
+  }
 }
 
 function renderEvent(event, options = {}) {
@@ -768,13 +975,16 @@ function renderEvent(event, options = {}) {
     box.className = "msg user";
     const content = blocksToText(data.content) || "（空）";
     appendMarkdown(box, content);
-    addMessageActions(box, content, options);
+    renderMessageImages(box, data.content);
+    if (options.actions === true) addMessageActions(box, content, options);
   } else if (type === "assistant/message") {
-    const text = blocksToText(data.message?.content ?? data.content);
-    if (!text) return null;
+    const messageContent = data.message?.content ?? data.content;
+    const text = blocksToText(messageContent);
+    if (!text && !(Array.isArray(messageContent) && messageContent.some((block) => block?.type === "image"))) return null;
     box.className = "msg assistant";
     appendMarkdown(box, text);
-    addMessageActions(box, text, options);
+    renderMessageImages(box, messageContent);
+    if (options.actions === true) addMessageActions(box, text, options);
   } else return null;
   return box;
 }
@@ -981,11 +1191,12 @@ function appendPendingUserMessage(text) {
   return pending;
 }
 
-function settlePendingMessage(pending, outcome) {
+function settlePendingMessage(pending, outcome, detail = "") {
   if (pending === null || pending === undefined) return;
   pending.box.classList.remove("pending-message");
   pending.box.classList.toggle("failed-message", outcome === "failed");
-  pending.status.textContent = outcome === "failed" ? "发送失败" : outcome === "received" ? "Harness 已接收" : "已送达";
+  pending.status.textContent = outcome === "failed" ? `发送失败${detail ? `：${detail}` : ""}` : outcome === "received" ? "Harness 已接收" : "已送达";
+  if (outcome === "failed" && detail) pending.box.title = detail;
   if (outcome === "received") setTimeout(() => pending.status.remove(), 1800);
   if (outcome !== "sent") pendingOutbound = pendingOutbound.filter((item) => item !== pending);
 }
@@ -1069,7 +1280,7 @@ async function loadHistory() {
       const event = entry.event;
       const turn = event?.data?.turn;
       const canFork = event?.type === "assistant/message" && endedTurns.has(turn) && lastAssistantSeqByTurn.get(turn) === event.seq;
-      const box = renderEvent(event, { seq: event?.seq, canFork });
+      const box = renderEvent(event, { seq: event?.seq, canFork, actions: true });
       if (box !== null) { container.appendChild(box); rendered += 1; }
     }
     rendered += appendPartialBlocks(container, partialBlocks, { running: currentSummary()?.running === true });
@@ -1082,7 +1293,7 @@ async function loadHistory() {
     historyLoading = false;
     const backlog = liveEventBacklog;
     liveEventBacklog = [];
-    for (const payload of backlog) handleRealtimePayload(payload, true);
+    for (const item of backlog) handleRealtimePayload(item.payload, true, item.rpcId);
     if (historyRefreshPending) { historyRefreshPending = false; scheduleHistoryRefresh(0); }
   }
 }
@@ -1103,21 +1314,35 @@ async function pollWhileRunning() {
 
 async function sendPrompt() {
   const text = $("input").value.trim();
-  if (!text || currentSessionId === null) return syncComposer();
+  if ((!text && imageDrafts.length === 0) || currentSessionId === null) return syncComposer();
   $("input").value = "";
+  const drafts = imageDrafts;
+  imageDrafts = [];
+  renderImageDrafts();
   $("btn-send").disabled = true;
-  const pending = appendPendingUserMessage(text);
+  const pending = appendPendingUserMessage(text || `图片消息（${drafts.length} 张）`);
   setCurrentRunning(true);
   setWorkingPhase("正在发送消息");
   try {
-    await api("/prompt", { method: "POST", body: { sessionId: currentSessionId, text } });
+    const images = await Promise.all(drafts.map(async ({ file }) => ({ type: "image", mediaType: file.type, data: await fileAsBase64(file), name: file.name })));
+    await api("/prompt", { method: "POST", body: { sessionId: currentSessionId, text, images } });
     settlePendingMessage(pending, "sent");
     setWorkingPhase("等待模型响应");
     setTimeout(() => {
       if (pendingOutbound.includes(pending) && Date.now() - lastRealtimeEventAt > 1_500) scheduleHistoryRefresh(0);
     }, 1_600);
     void pollWhileRunning();
-  } catch (error) { settlePendingMessage(pending, "failed"); finishWorking(); setCurrentRunning(false); toast(String(error.message ?? error)); await refresh({ quiet: true }); }
+  } catch (error) {
+    for (const draft of drafts) imageDrafts.push(draft);
+    renderImageDrafts();
+    const message = String(error.message ?? error);
+    const detail = /does not support image input/i.test(message) ? "当前模型不支持图片，请先切换支持视觉输入的模型" : message;
+    settlePendingMessage(pending, "failed", detail);
+    finishWorking();
+    setCurrentRunning(false);
+    toast(detail);
+    await refresh({ quiet: true });
+  }
   finally { syncComposer(); }
 }
 
@@ -1129,11 +1354,18 @@ async function cancelTurn() {
 
 async function updateQueueItem(itemId, action, text) {
   if (currentSessionId === null) return;
+  const activity = currentActivity();
+  const previous = activity === undefined ? null : structuredClone(activity.queueItems ?? []);
+  if (activity !== undefined) {
+    if (action === "remove" || action === "steer") activity.queueItems = (activity.queueItems ?? []).filter((item) => item.id !== itemId);
+    else if (action === "edit") activity.queueItems = (activity.queueItems ?? []).map((item) => item.id === itemId ? { ...item, text, optimistic: true } : item);
+    activity.queueLength = (activity.queueItems ?? []).filter((item) => item.placement === "queued").length;
+    renderStatusLine();
+  }
   try {
     await api("/queue", { method: "POST", body: { sessionId: currentSessionId, itemId, action, ...(action === "edit" ? { text } : {}) } });
     toast(action === "remove" ? "已删除排队消息" : action === "steer" ? "已插话发送" : "排队消息已更新");
-    await refresh({ quiet: true });
-  } catch (error) { toast(String(error.message ?? error)); }
+  } catch (error) { if (activity !== undefined && previous !== null) { activity.queueItems = previous; activity.queueLength = previous.filter((item) => item.placement === "queued").length; renderStatusLine(); } toast(String(error.message ?? error)); }
 }
 
 function openQueueEditor(item) {
@@ -1217,6 +1449,22 @@ function closeCommandMenu() {
 function openCommandMenu() {
   const list = $("command-list");
   list.innerHTML = "";
+  const imageButton = document.createElement("button");
+  imageButton.type = "button";
+  imageButton.className = "command-item";
+  imageButton.setAttribute("role", "menuitem");
+  const imageIcon = document.createElement("span");
+  imageIcon.className = "command-slash";
+  imageIcon.textContent = "▧";
+  const imageCopy = document.createElement("div");
+  const imageName = document.createElement("strong");
+  imageName.textContent = "添加图片";
+  const imageDescription = document.createElement("span");
+  imageDescription.textContent = "选择最多 4 张图片发送给多模态模型";
+  imageCopy.append(imageName, imageDescription);
+  imageButton.append(imageIcon, imageCopy);
+  imageButton.addEventListener("click", () => { closeCommandMenu(); $("image-input").click(); });
+  list.appendChild(imageButton);
   for (const command of controls?.commands ?? []) {
     const button = document.createElement("button");
     button.type = "button";
@@ -1229,7 +1477,10 @@ function openCommandMenu() {
     const name = document.createElement("strong");
     name.textContent = command.name;
     const description = document.createElement("span");
-    description.textContent = command.description;
+    const plan = currentSummary()?.plan ?? currentSummary()?.activity?.projections?.plan;
+    description.textContent = command.name === "plan"
+      ? plan?.pending ? "计划等待确认" : plan?.active ? "当前已开启，点击退出计划模式" : "当前已关闭，点击进入计划模式"
+      : command.description;
     copy.append(name, description);
     button.append(slash, copy);
     button.addEventListener("click", () => handleCommand(command));
@@ -1252,6 +1503,15 @@ async function handleCommand(command) {
   if (currentSessionId === null) return;
   if (command.action === "permission") return openPermissionSheet();
   if (command.action === "model") return openModelSheet();
+  if (command.name === "plan") {
+    const plan = currentSummary()?.plan ?? currentSummary()?.activity?.projections?.plan;
+    const active = plan?.active === true;
+    try {
+      await api("/command", { method: "POST", body: { sessionId: currentSessionId, line: active ? "/plan off" : "/plan on" } });
+      toast(active ? "正在退出计划模式" : "正在进入计划模式");
+    } catch (error) { toast(String(error.message ?? error)); }
+    return;
+  }
   if (command.action === "download") {
     location.href = `/mobile-api/export?sessionId=${encodeURIComponent(currentSessionId)}`;
     return toast("正在导出会话日志");
@@ -1484,7 +1744,7 @@ function currentActivity() {
   return currentSummary()?.activity;
 }
 
-function applyAuxiliaryFrame(payload) {
+function applyAuxiliaryFrame(payload, rpcId) {
   const activity = currentActivity();
   if (activity === undefined) return;
   if (payload.type === "session/queue") {
@@ -1494,8 +1754,11 @@ function applyAuxiliaryFrame(payload) {
     }).filter((item) => typeof item.id === "string");
     activity.queueLength = activity.queueItems.filter((item) => item.placement === "queued").length;
   } else if (payload.type === "session/jobs") activity.jobs = Array.isArray(payload.jobs) ? payload.jobs.length : 0;
-  else if (payload.type === "approval/requested") activity.pendingApproval = { toolName: payload.toolName, reason: payload.reason };
+  else if (payload.type === "approval/requested") activity.pendingApproval = { rpcId, approvalId: payload.approvalId, toolName: payload.toolName, reason: payload.reason };
   else if (payload.type === "approval/resolved") activity.pendingApproval = void 0;
+  else if (payload.type === "question/requested") activity.pendingQuestion = { rpcId, questions: payload.questions ?? [] };
+  else if (payload.type === "question/resolved") activity.pendingQuestion = void 0;
+  else if (payload.type === "session/projection") { currentSummary()[payload.key] = payload.value; activity.projections ??= {}; activity.projections[payload.key] = payload.value; }
   renderStatusLine();
 }
 
@@ -1504,11 +1767,11 @@ function appendRealtimeNode(node) {
   appendLiveNode(node);
 }
 
-function handleRealtimePayload(payload, replay = false) {
+function handleRealtimePayload(payload, replay = false, rpcId) {
   if (payload === null || typeof payload !== "object" || payload.sessionId !== currentSessionId) return;
-  if (historyLoading && !replay) { liveEventBacklog.push(payload); return; }
+  if (historyLoading && !replay) { liveEventBacklog.push({ payload, rpcId }); return; }
   lastRealtimeEventAt = Date.now();
-  if (payload.type !== "session/event") { applyAuxiliaryFrame(payload); if (["session/queue", "session/jobs", "approval/requested", "approval/resolved"].includes(payload.type)) return; }
+  if (payload.type !== "session/event") { applyAuxiliaryFrame(payload, rpcId); if (["session/queue", "session/jobs", "approval/requested", "approval/resolved", "question/requested", "question/resolved", "session/projection"].includes(payload.type)) return; }
   const event = payload.event;
   if (event === null || typeof event !== "object") return;
   if (replay && Number.isSafeInteger(event.seq) && historyEventSeqs.has(event.seq)) return;
@@ -1533,7 +1796,7 @@ function handleRealtimePayload(payload, replay = false) {
       const pending = pendingOutbound.find((item) => item.text === content);
       if (pending !== undefined) { settlePendingMessage(pending, "received"); return; }
     } else setWorkingPhase("正在注入上下文");
-    appendRealtimeNode(renderEvent(event, { seq: event.seq }));
+    appendRealtimeNode(renderEvent(event, { seq: event.seq, actions: true }));
     return;
   }
   if (type === "tool/call") {
@@ -1606,7 +1869,7 @@ function startSse() {
     eventSource = new EventSource("/mobile-api/events");
     eventSource.onopen = () => { lastRealtimeEventAt = Date.now(); setConnection("online", connection.detail, connection.latencyMs); void updateLatency(); };
     eventSource.onmessage = (message) => {
-      try { handleRealtimePayload(JSON.parse(message.data)?.payload); } catch {}
+      try { const envelope = JSON.parse(message.data); handleRealtimePayload(envelope?.payload, false, envelope?.rpcId); } catch {}
     };
     eventSource.onerror = () => { stopSse(); if (state !== null) { setConnection("offline", "实时连接断开，正在自动重连…"); scheduleReconnect(); } };
   } catch { setConnection("offline", "无法建立实时连接，正在自动重连…"); scheduleReconnect(); }
@@ -1668,6 +1931,7 @@ function switchPage(name) {
 }
 
 document.addEventListener("DOMContentLoaded", () => {
+  $("composer-form").prepend($("image-draft"));
   $("btn-login").addEventListener("click", async () => { $("login-error").classList.add("hidden"); try { await tryLogin($("login-token").value); } catch (error) { $("login-error").textContent = String(error.message ?? error); $("login-error").classList.remove("hidden"); } });
   $("login-token").addEventListener("keydown", (event) => { if (event.key === "Enter") $("btn-login").click(); });
   $("btn-refresh").addEventListener("click", () => reconnect());
@@ -1689,6 +1953,11 @@ document.addEventListener("DOMContentLoaded", () => {
     else void sendPrompt();
   });
   $("input").addEventListener("input", syncComposer);
+  document.addEventListener("click", (event) => {
+    const message = event.target.closest?.(".msg.has-message-actions") ?? null;
+    if (message === null) closeMessageActions();
+  });
+  $("image-input").addEventListener("change", (event) => { selectImages(event.target.files ?? []); event.target.value = ""; });
   $("btn-command-menu").addEventListener("click", () => $("command-menu").classList.contains("hidden") ? openCommandMenu() : closeCommandMenu());
   $("popover-scrim").addEventListener("click", closeCommandMenu);
   $("btn-permission").addEventListener("click", openPermissionSheet);

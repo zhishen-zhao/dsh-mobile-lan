@@ -43,6 +43,7 @@ ok("LAN proxy allowlists only the mobile surface and overwrites forwarding heade
 // {rpcId, result: {ok, value | error}}.
 const calls = {
 	prompts: [],
+	responses: [],
 	ssh: []
 };
 const fakeSessions = [{
@@ -69,6 +70,7 @@ const fakeApiProxy = {
 			calls.prompts.push(request.payload);
 			return okResult(request, { accepted: true });
 		},
+		attachment: async (request) => okResult(request, { attachment: { attachmentId: request.payload.attachmentId, mediaType: "image/png", bytes: 8, width: 1, height: 1, name: "pixel.png" }, data: "iVBORw0KGgo=" }),
 		cancel: async (request) => {
 			calls.prompts.push({ cancel: request.payload });
 			return okResult(request, { accepted: true });
@@ -103,6 +105,9 @@ const fakeApiProxy = {
 			// abort signal the plugin passes on dispose.
 			for (;;) {
 				yield { rpcId: "mux-queue", payload: { type: "session/queue", sessionId: "s-new", items: [{ id: "q1", placement: "queued", message: { content: [{ type: "text", text: "排队任务" }] } }] } };
+				yield { rpcId: "mux-question", payload: { type: "question/requested", sessionId: "s-new", questions: [{ id: "choice", header: "确认", question: "选择方式", options: [{ label: "A" }, { label: "B" }] }] } };
+				yield { rpcId: "mux-approval", payload: { type: "approval/requested", sessionId: "s-new", approvalId: "approval-1", toolName: "write", reason: "修改文件" } };
+				yield { rpcId: "mux-plan", payload: { type: "session/projection", sessionId: "s-new", key: "plan", value: { active: true, pending: false }, seq: 3 } };
 				yield { rpcId: "mux-1", payload: { type: "session/event", sessionId: "s-new", event: { type: "turn/end" } } };
 				await new Promise((resolvePromise) => {
 					const timer = setTimeout(resolvePromise, 50);
@@ -114,7 +119,8 @@ const fakeApiProxy = {
 				if (signal?.aborted === true) return;
 			}
 		}
-	}
+	},
+	respond: async (message) => { calls.responses.push(message); return { accepted: true }; }
 };
 const fakeTools = {
 	get(toolName) {
@@ -263,6 +269,13 @@ async function main() {
 		assert.match(app.text, /historyEventSeqs\.has\(event\.seq\)/);
 		assert.doesNotMatch(app.text, /queueEventRefresh/);
 		assert.match(app.text, /createElementNS\("http:\/\/www\.w3\.org\/2000\/svg", "svg"\)/);
+		assert.match(app.text, /imageDrafts/);
+		assert.match(app.text, /question\/requested/);
+		assert.match(app.text, /plan-review/);
+		assert.match(app.text, /optimistic/);
+		assert.match(app.text, /options\.actions === true/);
+		assert.match(app.text, /actions-visible/);
+		assert.match(app.text, /closeMessageActions/);
 		assert.doesNotMatch(app.text, /fork\.textContent = "⎇"/);
 		ok("GET /mobile/app.js serves the online-only client script");
 	}
@@ -282,6 +295,7 @@ async function main() {
 		assert.equal(appCss.status, 200);
 		assert.match(appCss.headers.get("content-type"), /text\/css/);
 		assert.match(appCss.text, /\.branch-action svg[^}]+stroke-width: 1\.55/);
+		assert.match(appCss.text, /\.message-actions \{ display: none/);
 		ok("message branch action uses the thin vector icon style");
 	}
 	{
@@ -438,6 +452,8 @@ async function main() {
 		const session = state.json.sessions.find((item) => item.sessionId === "s-new");
 		assert.equal(session.activity.queueItems[0].text, "排队任务");
 		assert.equal(session.activity.queueItems[0].editable, true);
+		assert.equal(session.activity.pendingQuestion.rpcId, "mux-question");
+		assert.equal(session.activity.pendingApproval.rpcId, "mux-approval");
 		const edited = await request(server, port, "/mobile-api/queue", { method: "POST", body: { sessionId: "s-new", itemId: "q1", action: "edit", text: "修改后的任务" } });
 		assert.equal(edited.status, 200);
 		ok("queue snapshots expose text safely and queue edits use session.updateQueue");
@@ -477,6 +493,32 @@ async function main() {
 		assert.equal(prompted.json.accepted, true);
 		assert.deepEqual(calls.prompts.at(-1), { sessionId: "s-new", mode: "queue", content: [{ type: "text", text: "帮我看看磁盘" }] });
 		ok("prompt proxies sessions.prompt with queue mode");
+	}
+	{
+		const imageData = "iVBORw0KGgo=";
+		const prompted = await request(server, port, "/mobile-api/prompt", { method: "POST", body: { sessionId: "s-new", text: "", images: [{ type: "image", mediaType: "image/png", data: imageData, name: "pixel.png" }] } });
+		assert.equal(prompted.status, 200);
+		assert.deepEqual(calls.prompts.at(-1).content, [{ type: "image", mediaType: "image/png", data: imageData, name: "pixel.png" }]);
+		const invalid = await request(server, port, "/mobile-api/prompt", { method: "POST", body: { sessionId: "s-new", text: "", images: [{ type: "image", mediaType: "image/svg+xml", data: imageData }] } });
+		assert.equal(invalid.status, 400);
+		ok("image-only prompts pass canonical raster attachments and reject unsupported media");
+	}
+	{
+		const question = await request(server, port, "/mobile-api/respond", { method: "POST", body: { sessionId: "s-new", kind: "question", rpcId: "mux-question", answers: [{ id: "choice", selected: ["A"] }] } });
+		assert.equal(question.status, 200);
+		assert.equal(calls.responses.at(-1).rpcId, "mux-question");
+		const approval = await request(server, port, "/mobile-api/respond", { method: "POST", body: { sessionId: "s-new", kind: "approval", rpcId: "mux-approval", outcome: "allowed-once" } });
+		assert.equal(approval.status, 200);
+		assert.equal(calls.responses.at(-1).result.value.approvalId, "approval-1");
+		const stale = await request(server, port, "/mobile-api/respond", { method: "POST", body: { sessionId: "s-new", kind: "question", rpcId: "unknown", cancel: true } });
+		assert.equal(stale.status, 409);
+		ok("question and approval responses echo only current pending rpc ids");
+	}
+	{
+		const attachment = await request(server, port, "/mobile-api/attachment?sessionId=s-new&attachmentId=image-1");
+		assert.equal(attachment.status, 200);
+		assert.equal(attachment.headers.get("content-type"), "image/png");
+		ok("durable session image bytes are exposed only through the scoped attachment route");
 	}
 	{
 		const bad = await request(server, port, "/mobile-api/prompt", { method: "POST", body: { sessionId: "s-new", text: "  " } });
