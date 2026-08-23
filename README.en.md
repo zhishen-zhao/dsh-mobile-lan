@@ -18,10 +18,11 @@ Bring a restricted [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-ha
 - Up-to-seven-day HttpOnly device session, revoked early on logout or Harness restart.
 - Session drawer, workspace grouping, optional desktop-session visibility, and a default workspace selector.
 - GFM Markdown, tables, blockquotes, task lists, code blocks, compact links, message copy, and conversation forks.
-- Multimodal image messages from the `+` menu: PNG/JPEG/WebP/GIF preview, removal, image-only prompts, and historical image rendering; the selected Harness model must declare `image` input support.
+- Multimodal image messages from the `+` menu: PNG/JPEG/WebP/GIF preview, removal, image-only prompts, and historical image rendering; the plugin reads Harness 0.1.1's exact `inputModalities` route and sends images only to models that declare `image` input.
 - Animation-frame live responses, reasoning, context injections, and collapsible tool/command timelines.
 - Message actions stay collapsed until a completed message is tapped; reasoning and streaming output do not automatically show copy controls.
 - Sending/delivered feedback, model work phases, elapsed processing time, completion notifications, and approval reminders.
+- Harness `turn/end.reason` outcomes distinguish completion, cancellation, output limits, and failures; failures remain visible as a persistent turn card with the concrete reason.
 - Structured `ask_user_question` answers, Plan review, tool approvals, and live queue-state convergence after mutations.
 - Running-turn queue editing, deletion, single-message steering, and steer-all.
 - Permission preset, agent preset, model, and reasoning-effort controls.
@@ -260,8 +261,8 @@ $env:Path = "$env:JAVA_HOME\bin;$env:Path"
 
 Current verified baseline:
 
-- `dsh-mobile-remote 0.9.0`: 46 smoke checks, including image attachments, interaction responses, optimistic queue updates, and collapsed message actions.
-- `dsh-tool-ssh 0.2.0`: 21 loopback SSH checks.
+- `dsh-mobile-remote 0.10.1`: 46 smoke checks, including Harness 0.1.1 image capability gating, ordered image/text prompts, turn-failure feedback, client time zones, interaction responses, optimistic queue updates, and collapsed message actions.
+- `dsh-tool-ssh 0.2.1`: 21 loopback SSH checks, compatible with `@deepseek-ai/dsh-* 0.1.1-rc.2`.
 - Production npm dependency audits: zero known vulnerabilities.
 - Android: `testDebugUnitTest`, `lintDebug`, and `assembleDebug` pass.
 

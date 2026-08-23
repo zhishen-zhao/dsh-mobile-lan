@@ -108,7 +108,19 @@ const fakeApiProxy = {
 				yield { rpcId: "mux-question", payload: { type: "question/requested", sessionId: "s-new", questions: [{ id: "choice", header: "确认", question: "选择方式", options: [{ label: "A" }, { label: "B" }] }] } };
 				yield { rpcId: "mux-approval", payload: { type: "approval/requested", sessionId: "s-new", approvalId: "approval-1", toolName: "write", reason: "修改文件" } };
 				yield { rpcId: "mux-plan", payload: { type: "session/projection", sessionId: "s-new", key: "plan", value: { active: true, pending: false }, seq: 3 } };
-				yield { rpcId: "mux-1", payload: { type: "session/event", sessionId: "s-new", event: { type: "turn/end" } } };
+				yield {
+					rpcId: "mux-1",
+					payload: {
+						type: "session/event",
+						sessionId: "s-new",
+						event: {
+							type: "turn/end",
+							seq: 9,
+							time: 1_800_000_000_000,
+							data: { turn: 1, reason: { kind: "error", error: { message: "vision request failed", code: "SERVER" } } }
+						}
+					}
+				};
 				await new Promise((resolvePromise) => {
 					const timer = setTimeout(resolvePromise, 50);
 					signal?.addEventListener("abort", () => {
@@ -144,6 +156,11 @@ const fakeTools = {
 	}
 };
 
+let fakeImageInput = true;
+const fakeLlm = {
+	resolveModelInfo: async () => ({ inputModalities: fakeImageInput ? ["text", "image"] : ["text"] })
+};
+
 function makeContext(config) {
 	const routes = [];
 	const ctx = new Context();
@@ -153,6 +170,7 @@ function makeContext(config) {
 	} });
 	ctx.provide("apiProxy", fakeApiProxy);
 	ctx.provide("tools", fakeTools);
+	ctx.provide("llm", fakeLlm);
 	ctx.plugin(plugin, config);
 	return { ctx, routes };
 }
@@ -276,6 +294,8 @@ async function main() {
 		assert.match(app.text, /options\.actions === true/);
 		assert.match(app.text, /actions-visible/);
 		assert.match(app.text, /closeMessageActions/);
+		assert.match(app.text, /本轮运行失败/);
+		assert.match(app.text, /reason\.kind === "error"/);
 		assert.doesNotMatch(app.text, /fork\.textContent = "⎇"/);
 		ok("GET /mobile/app.js serves the online-only client script");
 	}
@@ -442,6 +462,8 @@ async function main() {
 		assert.equal(controls.status, 200);
 		assert.equal(controls.json.permissions.currentValue, "workspace-write");
 		assert.equal(controls.json.models.current.model, "model-a");
+		assert.deepEqual(controls.json.models.groups[0].models[0].inputModalities, ["text", "image"]);
+		assert.equal(controls.json.imageInput.supported, true);
 		assert.equal(controls.json.agentPresets[0].id, "standard");
 		assert.deepEqual(controls.json.commands.map((item) => item.name), ["compact", "export", "feedback", "goal", "permission", "plan", "model"]);
 		ok("session controls expose permission, model, preset, and command catalogs");
@@ -454,6 +476,8 @@ async function main() {
 		assert.equal(session.activity.queueItems[0].editable, true);
 		assert.equal(session.activity.pendingQuestion.rpcId, "mux-question");
 		assert.equal(session.activity.pendingApproval.rpcId, "mux-approval");
+		assert.equal(session.activity.lastFailure.message, "vision request failed");
+		assert.equal(session.activity.lastFailure.code, "SERVER");
 		const edited = await request(server, port, "/mobile-api/queue", { method: "POST", body: { sessionId: "s-new", itemId: "q1", action: "edit", text: "修改后的任务" } });
 		assert.equal(edited.status, 200);
 		ok("queue snapshots expose text safely and queue edits use session.updateQueue");
@@ -501,6 +525,14 @@ async function main() {
 		assert.deepEqual(calls.prompts.at(-1).content, [{ type: "image", mediaType: "image/png", data: imageData, name: "pixel.png" }]);
 		const invalid = await request(server, port, "/mobile-api/prompt", { method: "POST", body: { sessionId: "s-new", text: "", images: [{ type: "image", mediaType: "image/svg+xml", data: imageData }] } });
 		assert.equal(invalid.status, 400);
+		const mixed = await request(server, port, "/mobile-api/prompt", { method: "POST", body: { sessionId: "s-new", text: "看这张图", images: [{ type: "image", mediaType: "image/png", data: imageData, name: "pixel.png" }] } });
+		assert.equal(mixed.status, 200);
+		assert.deepEqual(calls.prompts.at(-1).content.map((part) => part.type), ["text", "image"]);
+		fakeImageInput = false;
+		const unsupported = await request(server, port, "/mobile-api/prompt", { method: "POST", body: { sessionId: "s-new", text: "不能发给纯文本模型", images: [{ type: "image", mediaType: "image/png", data: imageData }] } });
+		assert.equal(unsupported.status, 400);
+		assert.equal(unsupported.json.reason, "MODEL_DOES_NOT_SUPPORT_IMAGES");
+		fakeImageInput = true;
 		ok("image-only prompts pass canonical raster attachments and reject unsupported media");
 	}
 	{

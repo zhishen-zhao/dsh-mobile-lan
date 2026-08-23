@@ -185,6 +185,15 @@ function mobileImagePart(value) {
 	return { part: { type: "image", mediaType: value.mediaType, data: value.data, ...(value.name === void 0 ? {} : { name: value.name }) }, bytes: bytes.length };
 }
 
+/** Resolve the optional LLM service without making it a hard plugin dependency. */
+function llmService(ctx) {
+	try {
+		return (typeof ctx.get === "function" ? ctx.get("llm") : void 0) ?? ctx.llm;
+	} catch {
+		return void 0;
+	}
+}
+
 function withSecurityHeaders(headers = {}) {
 	return { ...SECURITY_HEADERS, ...headers };
 }
@@ -367,7 +376,7 @@ function apply(ctx, config = {}) {
 	const runtimeFor = (sessionId) => {
 		let runtime = sessionRuntime.get(sessionId);
 		if (runtime === void 0) {
-			runtime = { queueLength: 0, queueItems: [], activeTool: void 0, jobs: 0, pendingApproval: void 0, pendingQuestion: void 0, lastCompletedAt: void 0 };
+			runtime = { queueLength: 0, queueItems: [], activeTool: void 0, jobs: 0, pendingApproval: void 0, pendingQuestion: void 0, lastCompletedAt: void 0, lastFailure: void 0 };
 			sessionRuntime.set(sessionId, runtime);
 		}
 		return runtime;
@@ -517,6 +526,7 @@ function apply(ctx, config = {}) {
 			const error = result?.error;
 			const wrapped = new Error(error?.message ?? `gateway call failed (${domain.name ?? "unknown"})`);
 			if (error?.code !== void 0) wrapped.code = error.code;
+			if (error?.details !== void 0) wrapped.details = error.details;
 			throw wrapped;
 		}
 		return result.value;
@@ -566,6 +576,36 @@ function apply(ctx, config = {}) {
 		const models = typeof ctx.apiProxy.sessions.models === "function"
 			? await call(ctx.apiProxy.sessions.models, { sessionId })
 			: { current: void 0, routable: false, groups: [], failures: [] };
+		let imageInput;
+		const current = models?.current;
+		const llm = llmService(ctx);
+		if (typeof llm?.resolveModelInfo === "function" && Array.isArray(models?.groups)) {
+			models.groups = await Promise.all(models.groups.map(async (group) => ({
+				...group,
+				models: await Promise.all((group.models ?? []).map(async (model) => {
+					try {
+						const info = await llm.resolveModelInfo(group.id, model.id);
+						return { ...model, ...(Array.isArray(info?.inputModalities) ? { inputModalities: [...info.inputModalities] } : {}) };
+					} catch {
+						return model;
+					}
+				}))
+			})));
+		}
+		if (current !== null && typeof current === "object" && typeof llm?.resolveModelInfo === "function") {
+			try {
+				const selected = models.groups?.find((group) => group.id === current.provider)?.models?.find((model) => model.id === current.model);
+				const info = selected?.inputModalities === void 0 ? await llm.resolveModelInfo(current.provider, current.model) : selected;
+				const modalities = Array.isArray(info?.inputModalities) ? info.inputModalities : void 0;
+				imageInput = {
+					supported: modalities === void 0 || modalities.includes("image"),
+					declared: modalities !== void 0,
+					modalities: modalities ?? ["text"]
+				};
+			} catch {
+				// Catalog failures must not make text-only mobile control unavailable.
+			}
+		}
 		const presetResult = typeof ctx.apiProxy.agentPresets?.list === "function"
 			? await call(ctx.apiProxy.agentPresets.list, {})
 			: { presets: [] };
@@ -573,6 +613,7 @@ function apply(ctx, config = {}) {
 			session: { sessionId, blank: summary.blank === true, running: summary.running === true, agentPreset: summary.agentPreset },
 			permissions: permissions !== null && typeof permissions === "object" ? permissions : void 0,
 			models,
+			imageInput,
 			agentPresets: Array.isArray(presetResult?.presets) ? presetResult.presets : [],
 			commands: MOBILE_COMMANDS
 		};
@@ -613,13 +654,26 @@ function apply(ctx, config = {}) {
 		} else if (payload.type === "session/projection") {
 			runtime.projections ??= {};
 			runtime.projections[payload.key] = payload.value;
+		} else if (payload.type === "host/agent-error") {
+			runtime.lastFailure = { kind: "error", message: typeof payload.message === "string" && payload.message.length > 0 ? payload.message : "Harness Agent 运行失败", at: Date.now() };
 		} else if (payload.type === "session/event") {
 			const event = payload.event;
-			if (event?.type === "tool/call") runtime.activeTool = typeof event.data?.name === "string" ? event.data.name : "工具";
+			if (event?.type === "turn/start") runtime.lastFailure = void 0;
+			else if (event?.type === "tool/call") runtime.activeTool = typeof event.data?.name === "string" ? event.data.name : "工具";
 			else if (event?.type === "tool/result") runtime.activeTool = void 0;
 			else if (event?.type === "turn/end") {
 				runtime.activeTool = void 0;
-				runtime.lastCompletedAt = Date.now();
+				const reason = event.data?.reason;
+				if (reason?.kind === "completed" || reason?.kind === "max-tokens" || reason === void 0) runtime.lastCompletedAt = Date.now();
+				if (reason?.kind === "error" || reason?.kind === "blocked" || reason?.kind === "interrupted") {
+					runtime.lastFailure = {
+						kind: reason.kind,
+						message: reason.kind === "error" ? reason.error?.message : reason.kind === "blocked" ? "任务被 Harness 运行策略阻止" : "Harness 重启或异常退出导致本轮中断",
+						code: reason.kind === "error" ? reason.error?.code : void 0,
+						at: Number.isFinite(event.time) ? event.time : Date.now(),
+						seq: event.seq
+					};
+				}
 			}
 		}
 	};
@@ -706,6 +760,7 @@ function apply(ctx, config = {}) {
 			if (req.method === "POST" && path === "/prompt") {
 				const sessionId = requireMobileSession(body.sessionId);
 				if (typeof body.text !== "string") return sendJson(res, 400, { ok: false, error: "prompt text must be a string" });
+				if (body.clientTimeZone !== void 0 && (typeof body.clientTimeZone !== "string" || body.clientTimeZone.length > 128 || (body.clientTimeZone !== "UTC" && !/^[A-Za-z][A-Za-z0-9_+.-]*(?:\/[A-Za-z0-9_+.-]+)+$/.test(body.clientTimeZone)))) return sendJson(res, 400, { ok: false, error: "clientTimeZone must be UTC or an IANA Area/Location name" });
 				if (Buffer.byteLength(body.text, "utf8") > maxPromptBytes) return sendJson(res, 400, { ok: false, error: `prompt exceeds the ${maxPromptBytes}-byte text limit` });
 				if (body.images !== void 0 && !Array.isArray(body.images)) return sendJson(res, 400, { ok: false, error: "images must be an array" });
 				const images = Array.isArray(body.images) ? body.images : [];
@@ -725,14 +780,26 @@ function apply(ctx, config = {}) {
 				const text = body.text.trim();
 				if (text.length === 0 && imageParts.length === 0) return sendJson(res, 400, { ok: false, error: "prompt needs text or at least one image" });
 				try {
+					if (imageParts.length > 0) {
+						const models = typeof ctx.apiProxy.sessions.models === "function" ? await call(ctx.apiProxy.sessions.models, { sessionId }) : void 0;
+						const current = models?.current;
+						const llm = llmService(ctx);
+						if (current !== null && typeof current === "object" && typeof llm?.resolveModelInfo === "function") {
+							const info = await llm.resolveModelInfo(current.provider, current.model);
+							if (Array.isArray(info?.inputModalities) && !info.inputModalities.includes("image")) {
+								return sendJson(res, 400, { ok: false, code: "attachment-error", reason: "MODEL_DOES_NOT_SUPPORT_IMAGES", error: `模型 ${current.model} 不支持图片输入，请先切换到支持视觉输入的模型。` });
+							}
+						}
+					}
 					const accepted = await call(ctx.apiProxy.sessions.prompt, {
 						sessionId,
 						mode: "queue",
-						content: [...imageParts, ...(text.length === 0 ? [] : [{ type: "text", text }])]
+						content: [...(text.length === 0 ? [] : [{ type: "text", text }]), ...imageParts],
+						...(body.clientTimeZone === void 0 ? {} : { clientTimeZone: body.clientTimeZone })
 					});
 					return sendJson(res, 200, { ok: true, accepted: accepted.accepted === true });
 				} catch (error) {
-					if (error?.code === "attachment-error") return sendJson(res, 400, { ok: false, error: error.message });
+					if (error?.code === "attachment-error") return sendJson(res, 400, { ok: false, code: error.code, reason: error.details?.reason, error: error.message });
 					throw error;
 				}
 			}

@@ -41,6 +41,23 @@ let queueExpanded = false;
 let imageDrafts = [];
 let connection = { phase: "connecting", latencyMs: null, detail: "正在连接 Harness…" };
 const expandedGroups = new Set();
+const FALLBACK_IMAGE_LIMITS = Object.freeze({
+  maxImageBytes: 5 * 1024 * 1024,
+  maxImagesPerMessage: 4,
+  maxMessageImageBytes: 16 * 1024 * 1024,
+  mediaTypes: ["image/png", "image/jpeg", "image/webp", "image/gif"]
+});
+
+function currentImageLimits() {
+  const limits = currentSummary()?.imageLimits;
+  if (limits === null || typeof limits !== "object") return FALLBACK_IMAGE_LIMITS;
+  return {
+    maxImageBytes: Number.isSafeInteger(limits.maxImageBytes) ? Math.min(limits.maxImageBytes, FALLBACK_IMAGE_LIMITS.maxImageBytes) : FALLBACK_IMAGE_LIMITS.maxImageBytes,
+    maxImagesPerMessage: Number.isSafeInteger(limits.maxImagesPerMessage) ? Math.min(limits.maxImagesPerMessage, FALLBACK_IMAGE_LIMITS.maxImagesPerMessage) : FALLBACK_IMAGE_LIMITS.maxImagesPerMessage,
+    maxMessageImageBytes: Number.isSafeInteger(limits.maxMessageImageBytes) ? Math.min(limits.maxMessageImageBytes, FALLBACK_IMAGE_LIMITS.maxMessageImageBytes) : FALLBACK_IMAGE_LIMITS.maxMessageImageBytes,
+    mediaTypes: Array.isArray(limits.mediaTypes) && limits.mediaTypes.length > 0 ? limits.mediaTypes.filter((type) => FALLBACK_IMAGE_LIMITS.mediaTypes.includes(type)) : FALLBACK_IMAGE_LIMITS.mediaTypes
+  };
+}
 
 function toast(message) {
   const el = $("toast");
@@ -73,10 +90,12 @@ function renderImageDrafts() {
 }
 
 function selectImages(files) {
-  const accepted = [...files].filter((file) => ["image/png", "image/jpeg", "image/webp", "image/gif"].includes(file.type) && file.size <= 5 * 1024 * 1024);
+  if (controls?.imageInput?.supported === false) return toast("当前模型不支持图片，请先切换支持视觉输入的模型");
+  const limits = currentImageLimits();
+  const accepted = [...files].filter((file) => limits.mediaTypes.includes(file.type) && file.size <= limits.maxImageBytes);
   if (accepted.length !== files.length) toast("仅支持 PNG、JPEG、WebP、GIF 图片");
-  if (imageDrafts.length + accepted.length > 4) return toast("每条消息最多添加 4 张图片");
-  if ([...imageDrafts.map((item) => item.file), ...accepted].reduce((sum, file) => sum + file.size, 0) > 16 * 1024 * 1024) return toast("每条消息的图片总计不能超过 16 MiB");
+  if (imageDrafts.length + accepted.length > limits.maxImagesPerMessage) return toast(`每条消息最多添加 ${limits.maxImagesPerMessage} 张图片`);
+  if ([...imageDrafts.map((item) => item.file), ...accepted].reduce((sum, file) => sum + file.size, 0) > limits.maxMessageImageBytes) return toast(`每条消息的图片总计不能超过 ${Math.round(limits.maxMessageImageBytes / 1024 / 1024)} MiB`);
   for (const file of accepted) imageDrafts.push({ file, url: URL.createObjectURL(file) });
   renderImageDrafts();
   syncComposer();
@@ -139,7 +158,10 @@ async function api(path, { method = "GET", body, query = {} } = {}) {
   const data = await response.json().catch(() => ({}));
   if (!response.ok || data.ok !== true) {
     if (response.status === 401) logout();
-    throw new Error(data.error ?? `HTTP ${response.status}`);
+    const error = new Error(data.error ?? `HTTP ${response.status}`);
+    if (data.code !== void 0) error.code = data.code;
+    if (data.reason !== void 0) error.reason = data.reason;
+    throw error;
   }
   return data;
 }
@@ -359,10 +381,18 @@ async function chooseSession(sessionId) {
 }
 
 function renderActivity(summary) {
-  const banner = $("activity-banner");
-  const text = $("activity-text");
-  const activity = summary?.activity;
-  banner.classList.remove("approval");
+	const banner = $("activity-banner");
+	const text = $("activity-text");
+	const activity = summary?.activity;
+	banner.classList.remove("approval", "failure");
+	if (summary?.running !== true && activity?.lastFailure !== undefined) {
+		const failure = activity.lastFailure;
+		text.textContent = `本轮运行失败${failure.message ? `：${failure.message}` : ""}`;
+		banner.classList.add("failure");
+		banner.classList.remove("hidden");
+		renderInteraction(summary);
+		return;
+	}
   if (activity?.pendingApproval !== undefined) {
     const approval = activity.pendingApproval;
     text.textContent = `等待许可批准：${approval.toolName ?? "工具"}${approval.reason ? `（${approval.reason}）` : ""}`;
@@ -512,6 +542,35 @@ function formatDuration(milliseconds) {
   if (seconds < 60) return `${seconds.toFixed(seconds < 10 ? 1 : 0)}s`;
   const minutes = Math.floor(seconds / 60);
   return `${minutes}m ${Math.floor(seconds % 60)}s`;
+}
+
+function describeTurnEnd(event) {
+	const reason = event?.data?.reason;
+	if (reason === undefined || reason?.kind === "completed") return { kind: "completed", title: "任务已完成", detail: "" };
+	if (reason.kind === "error") {
+		const message = typeof reason.error?.message === "string" && reason.error.message.trim().length > 0 ? reason.error.message.trim() : "模型或 Harness 在处理过程中发生错误";
+		const code = typeof reason.error?.code === "string" && reason.error.code !== "UNKNOWN" ? `（${reason.error.code}）` : "";
+		return { kind: "failure", title: "本轮运行失败", detail: `${message}${code}` };
+	}
+	if (reason.kind === "blocked") return { kind: "failure", title: "本轮运行失败", detail: "任务被 Harness 运行策略阻止" };
+	if (reason.kind === "interrupted") return { kind: "failure", title: "本轮运行失败", detail: "Harness 重启或异常退出导致本轮中断" };
+	if (reason.kind === "max-tokens") return { kind: "warning", title: "本轮达到输出上限", detail: "模型已达到本轮最大输出长度，可以继续发送消息让它接着处理" };
+	if (reason.kind === "aborted") return { kind: "aborted", title: "本轮已停止", detail: reason.reason?.kind === "user" ? "已按用户请求停止运行" : "本轮运行已被取消" };
+	return { kind: "failure", title: "本轮运行失败", detail: `未知结束状态：${String(reason.kind ?? "unknown")}` };
+}
+
+function renderTurnOutcome(event) {
+	const outcome = describeTurnEnd(event);
+	if (outcome.kind === "completed" || outcome.kind === "aborted") return null;
+	const card = document.createElement("section");
+	card.className = `turn-outcome${outcome.kind === "warning" ? " warning" : ""}`;
+	card.setAttribute("role", outcome.kind === "failure" ? "alert" : "status");
+	const title = document.createElement("strong");
+	title.textContent = outcome.title;
+	const detail = document.createElement("p");
+	detail.textContent = outcome.detail;
+	card.append(title, detail);
+	return card;
 }
 
 function currentModelDisplayName() {
@@ -1267,7 +1326,12 @@ async function loadHistory() {
         appendCommandResult(node, entry.event);
         continue;
       }
-      if (entry.event?.type === "turn/end") { historyActiveTool = null; continue; }
+			if (entry.event?.type === "turn/end") {
+				historyActiveTool = null;
+				const outcome = renderTurnOutcome(entry.event);
+				if (outcome !== null) { container.appendChild(outcome); rendered += 1; }
+				continue;
+			}
       if (entry.event?.type === "assistant/message") {
         partialBlocks.clear();
         const content = entry.event.data?.message?.content ?? entry.event.data?.content;
@@ -1320,12 +1384,15 @@ async function sendPrompt() {
   imageDrafts = [];
   renderImageDrafts();
   $("btn-send").disabled = true;
-  const pending = appendPendingUserMessage(text || `图片消息（${drafts.length} 张）`);
-  setCurrentRunning(true);
+	const pending = appendPendingUserMessage(text || `图片消息（${drafts.length} 张）`);
+	const activity = currentActivity();
+	if (activity !== undefined) activity.lastFailure = void 0;
+	setCurrentRunning(true);
   setWorkingPhase("正在发送消息");
   try {
     const images = await Promise.all(drafts.map(async ({ file }) => ({ type: "image", mediaType: file.type, data: await fileAsBase64(file), name: file.name })));
-    await api("/prompt", { method: "POST", body: { sessionId: currentSessionId, text, images } });
+    const clientTimeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    await api("/prompt", { method: "POST", body: { sessionId: currentSessionId, text, images, ...(clientTimeZone ? { clientTimeZone } : {}) } });
     settlePendingMessage(pending, "sent");
     setWorkingPhase("等待模型响应");
     setTimeout(() => {
@@ -1336,7 +1403,9 @@ async function sendPrompt() {
     for (const draft of drafts) imageDrafts.push(draft);
     renderImageDrafts();
     const message = String(error.message ?? error);
-    const detail = /does not support image input/i.test(message) ? "当前模型不支持图片，请先切换支持视觉输入的模型" : message;
+    const detail = error.reason === "MODEL_DOES_NOT_SUPPORT_IMAGES" || /does not support image input/i.test(message) || /不支持图片输入/.test(message)
+      ? "当前模型不支持图片，请先切换支持视觉输入的模型"
+      : message;
     settlePendingMessage(pending, "failed", detail);
     finishWorking();
     setCurrentRunning(false);
@@ -1460,10 +1529,14 @@ function openCommandMenu() {
   const imageName = document.createElement("strong");
   imageName.textContent = "添加图片";
   const imageDescription = document.createElement("span");
-  imageDescription.textContent = "选择最多 4 张图片发送给多模态模型";
+  const limits = currentImageLimits();
+  imageDescription.textContent = controls?.imageInput?.supported === false
+    ? "当前模型不支持图片输入"
+    : `选择最多 ${limits.maxImagesPerMessage} 张图片发送给多模态模型`;
   imageCopy.append(imageName, imageDescription);
   imageButton.append(imageIcon, imageCopy);
-  imageButton.addEventListener("click", () => { closeCommandMenu(); $("image-input").click(); });
+  imageButton.disabled = controls?.imageInput?.supported === false;
+  imageButton.addEventListener("click", () => { closeCommandMenu(); if (!imageButton.disabled) $("image-input").click(); });
   list.appendChild(imageButton);
   for (const command of controls?.commands ?? []) {
     const button = document.createElement("button");
@@ -1637,7 +1710,9 @@ function openModelSheet() {
       for (const model of group.models ?? []) {
         const current = models.current?.provider === group.id && models.current?.model === model.id;
         const efforts = model.reasoning?.efforts ?? [];
-        const description = model.description ?? (efforts.length > 0 ? "可选择推理强度" : "");
+        const vision = model.inputModalities?.includes?.("image") === true;
+        const details = [model.description, vision ? "支持图片" : "", efforts.length > 0 ? "可选择推理强度" : ""].filter(Boolean);
+        const description = details.join(" · ");
         content.appendChild(optionRow(model.name ?? model.id, description, current, () => {
           if (efforts.length > 0) openReasoningSheet(group, model);
           else void setModel(group.id, model.id);
@@ -1757,8 +1832,9 @@ function applyAuxiliaryFrame(payload, rpcId) {
   else if (payload.type === "approval/requested") activity.pendingApproval = { rpcId, approvalId: payload.approvalId, toolName: payload.toolName, reason: payload.reason };
   else if (payload.type === "approval/resolved") activity.pendingApproval = void 0;
   else if (payload.type === "question/requested") activity.pendingQuestion = { rpcId, questions: payload.questions ?? [] };
-  else if (payload.type === "question/resolved") activity.pendingQuestion = void 0;
-  else if (payload.type === "session/projection") { currentSummary()[payload.key] = payload.value; activity.projections ??= {}; activity.projections[payload.key] = payload.value; }
+	else if (payload.type === "question/resolved") activity.pendingQuestion = void 0;
+	else if (payload.type === "host/agent-error") activity.lastFailure = { kind: "error", message: typeof payload.message === "string" ? payload.message : "Harness Agent 运行失败", at: Date.now() };
+	else if (payload.type === "session/projection") { currentSummary()[payload.key] = payload.value; activity.projections ??= {}; activity.projections[payload.key] = payload.value; }
   renderStatusLine();
 }
 
@@ -1785,8 +1861,10 @@ function handleRealtimePayload(payload, replay = false, rpcId) {
     applyLiveChunk(event);
     return;
   }
-  if (type === "turn/start" || type === "step/start") {
-    setCurrentRunning(true);
+	if (type === "turn/start" || type === "step/start") {
+		const activity = currentActivity();
+		if (type === "turn/start" && activity !== undefined) activity.lastFailure = void 0;
+		setCurrentRunning(true);
     setWorkingPhase(type === "turn/start" ? "正在分析任务" : "正在准备模型请求", { startedAt: event.time });
     return;
   }
@@ -1849,15 +1927,25 @@ function handleRealtimePayload(payload, replay = false, rpcId) {
     return;
   }
   if (type === "assistant/message") { setWorkingPhase("正在整理回复"); return; }
-  if (type === "turn/end") {
-    setCurrentRunning(false);
-    const elapsed = finishWorking();
-    const activity = currentActivity();
-    const completedAt = Date.now();
-    if (activity !== undefined) { activity.activeTool = void 0; activity.lastCompletedAt = completedAt; }
-    lastCompletionAt = completedAt;
-    toast(elapsed === null ? "任务已完成" : `任务已完成 · ${formatDuration(elapsed)}`);
-    renderActivity(currentSummary());
+	if (type === "turn/end") {
+		setCurrentRunning(false);
+		const elapsed = finishWorking();
+		const activity = currentActivity();
+		const endedAt = Date.now();
+		const outcome = describeTurnEnd(event);
+		if (activity !== undefined) {
+			activity.activeTool = void 0;
+			if (outcome.kind === "completed" || outcome.kind === "warning") activity.lastCompletedAt = endedAt;
+			if (outcome.kind === "failure") activity.lastFailure = { kind: event.data?.reason?.kind ?? "error", message: outcome.detail, at: endedAt, seq: event.seq };
+		}
+		if (outcome.kind === "completed") {
+			lastCompletionAt = endedAt;
+			toast(elapsed === null ? "任务已完成" : `任务已完成 · ${formatDuration(elapsed)}`);
+		} else if (outcome.kind === "failure") {
+			appendRealtimeNode(renderTurnOutcome(event));
+			toast("本轮运行失败");
+		} else toast(outcome.title);
+		renderActivity(currentSummary());
     scheduleHistoryRefresh(120);
     scheduleStateRefresh(180);
   }

@@ -3,8 +3,9 @@
 A **single-user** dsh remote-control PWA. The Harness stays on the local machine; a paired phone opens `/mobile/` over HTTPS and can install it as an app-like home-screen experience.
 
 - Chat through mobile-created sessions. Desktop sessions are hidden by default.
-- Multimodal image prompts from the composer `+` menu, with local preview and scoped historical attachment loading. The selected Harness model must declare image input support.
+- Multimodal image prompts from the composer `+` menu, with local preview and scoped historical attachment loading. The plugin targets Harness `0.1.1-rc.2` durable attachments and gates image prompts using the exact route's `inputModalities`.
 - Structured user-question answers, Plan review, tool approvals, optimistic queue updates, and collapsed message actions.
+- Structured `turn/end.reason` handling keeps failed turns visible with their concrete error instead of reporting every ending as completed.
 - Reuse the optional [dsh-tool-ssh](../optional/dsh-tool-ssh) without copying credentials. Phone SSH is limited to explicitly configured aliases and follows the SSH tool's policy.
 - A one-time pairing code is submitted to `/mobile-api/login`; the app then uses an up-to-7-day `HttpOnly`, `SameSite=Strict` device session. Android encrypts the short-lived session with Android Keystore. The long-lived root secret is never stored in browser storage, a URL, or the app.
 - HTTPS is required for transport protection and PWA installation. The bundled LAN proxy terminates TLS while the Harness remains loopback-only.

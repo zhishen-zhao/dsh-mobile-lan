@@ -144,6 +144,12 @@ textarea:focus, input:focus, select:focus, button:focus-visible { border-color: 
 .empty-tip { display: grid; min-height: 48vh; place-items: center; color: var(--faint); font-size: 0.86rem; text-align: center; }
 .activity-banner { margin: 10px 12px 0; padding: 9px 11px; border: 1px solid color-mix(in srgb, var(--accent) 40%, var(--border)); border-radius: 8px; background: var(--accent-soft); color: var(--accent-text); font-size: 0.78rem; }
 .activity-banner.approval { border-color: color-mix(in srgb, var(--warning) 50%, var(--border)); color: var(--warning); }
+.activity-banner.failure { border-color: color-mix(in srgb, var(--danger) 55%, var(--border)); background: color-mix(in srgb, var(--danger) 10%, var(--surface)); color: var(--danger); }
+.turn-outcome { width: min(100%, 720px); margin: 0 0 12px; padding: 10px 12px; border: 1px solid color-mix(in srgb, var(--danger) 48%, var(--border)); border-radius: 8px; background: color-mix(in srgb, var(--danger) 8%, var(--surface)); color: var(--text); }
+.turn-outcome strong { display: block; color: var(--danger); font-size: 0.82rem; }
+.turn-outcome p { margin: 5px 0 0; color: var(--muted); font-size: 0.74rem; line-height: 1.45; overflow-wrap: anywhere; }
+.turn-outcome.warning { border-color: color-mix(in srgb, var(--warning) 48%, var(--border)); background: color-mix(in srgb, var(--warning) 8%, var(--surface)); }
+.turn-outcome.warning strong { color: var(--warning); }
 .composer { flex: 0 0 auto; margin: 0 10px calc(8px + env(safe-area-inset-bottom, 0px)); padding: 10px; border: 1px solid var(--border-strong); border-radius: 12px; background: var(--surface); box-shadow: 0 8px 30px rgba(20, 32, 50, 0.10); }
 .image-draft { display: flex; gap: 8px; max-width: 100%; margin: 0 0 8px; overflow-x: auto; }
 .image-draft-item { position: relative; width: 70px; height: 70px; flex: 0 0 auto; overflow: hidden; border: 1px solid var(--border); border-radius: 7px; background: var(--surface-2); }
