@@ -10,7 +10,8 @@ a multi-user service and must not be exposed directly to the public Internet.
 - The proxy allowlists `/mobile`, `/mobile/`, and `/mobile-api/`; it does not
   forward the Harness desktop UI or `/api` surface.
 - Generate a different CA and server key for every installation. Never commit
-  files under `certs/` or `dsh_mobile_local_ca.pem`.
+  files under `certs/`. The Android app binds the exact public leaf-certificate
+  SHA-256 fingerprint delivered by the one-time QR and does not need a shared CA.
 - Keep `allowExistingSessions: false` and `sshAliases: []` unless the broader
   scope is explicitly required.
 

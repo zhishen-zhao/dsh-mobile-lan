@@ -53,11 +53,6 @@ try {
     Assert-NativeSuccess 'SSH dependency audit'
 } finally { Pop-Location }
 
-$ca = Join-Path $root 'android\app\src\main\res\raw\dsh_mobile_local_ca.pem'
-if (-not (Test-Path -LiteralPath $ca)) {
-    throw 'Android CA is missing. Run scripts/setup-local-tls.ps1 -HostName <LAN-IP-or-DNS> first.'
-}
-
 Push-Location (Join-Path $root 'android')
 try {
     .\gradlew.bat testDebugUnitTest lintDebug assembleDebug

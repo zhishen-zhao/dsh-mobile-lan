@@ -75,19 +75,18 @@ $env:DSH_MOBILE_PAIRING_TOKEN = [Convert]::ToBase64String($bytes)
 显式设置 `allowInlineAccessToken: true`。`allowExistingSessions: true` 会把全部
 Harness 会话暴露给已配对手机，应只在确有需要时启用。
 
-`sshAliases` 是**服务端授权**，而不只是界面下拉列表；它还会受到
+当本插件与本机设置服务同时启用时，`http://127.0.0.1:3080` 的“设置”弹窗左栏会新增“手机端”，并与“悬浮宠物”并列。该页可持久化手机端标题、保留历史数量、会话有效期及“只在已配置工作区内选择”的开关；也会直接显示仅本机可读的一次性配对二维码，并可刷新而不暴露长期配对密钥。生成二维码前会检查所公布的局域网 TLS 端点是否正在监听；代理未启动时页面会明确提示运行 `scripts/start-mobile-lan.ps1`，不会继续展示无法使用的二维码。配对密钥、HTTPS 地址、SSH 别名和工作区范围仍只允许在部署 YAML 中修改。
+
+悬浮宠物、电脑凭据、文件管理和无关全局设置不会进入手机状态或 API。`sshAliases` 是**服务端授权**，而不只是界面下拉列表；它还会受到
 `dsh-tool-ssh` 的精确命令、工作目录、主机密钥和超时策略约束。
 
 ## HTTPS 局域网访问与安装
 
 不要使用 `dsh web --host 0.0.0.0` 或 `--trusted-host`。保留默认的本机监听，使用
 本项目的 TLS 代理。完整安装建议按仓库根目录 README 运行
-`.\scripts\start-mobile-lan.ps1`，它会自动启动 Harness、复用 CA 为当前物理局域网
-IPv4 重签服务证书、重启代理并更新动态端点文件。以下是手动部署原理：
+`.\scripts\install.ps1`；它会生成环境密钥、安装插件、注册用户登录任务并启动地址监控。同一地址会复用仍然有效的叶证书，端点文件同时记录证书 SHA-256 指纹。以下是手动部署原理：
 
-1. 为电脑的局域网 IP 或名称取得一张 TLS 证书。此仓库的 Android App 可将这台电脑
-   的本地 CA 固定内置，因此无需让手机全局信任 CA；若使用 PWA 或其他客户端，仍应
-   使用该客户端信任的 CA 或受管证书。
+1. 为电脑的局域网 IP 或名称取得一张带正确 SAN 的 TLS 证书。Android App 从一次性二维码绑定当前叶证书指纹，不需要把 CA 固定进 APK，也不会修改手机全局 CA；若使用普通浏览器 PWA，仍应使用浏览器信任的 CA 或受管证书。
 2. 保持 Harness 运行：
 
    ```powershell
@@ -111,7 +110,7 @@ IPv4 重签服务证书、重启代理并更新动态端点文件。以下是手
 5. 在 Android App 中点“扫描电脑二维码”并扫描。随后按浏览器提示安装 PWA 到主屏幕
    （或直接使用原生 App）；会话有效期内重新打开 App 不需再次输入配对密钥。
 
-若浏览器提示证书不受信任，请先修复证书链，不要降级到 HTTP。HTTPS 为传输提供
+若普通浏览器提示证书不受信任，请先修复证书链，不要降级到 HTTP；Android App 则应刷新二维码重新绑定当前证书。HTTPS 为传输提供
 加密、完整性和服务端认证，[MDN 的 TLS 说明](https://developer.mozilla.org/en-US/docs/Web/Security/Defenses/Transport_Layer_Security)；Service Worker 也要求 HTTPS（`localhost` 除外），[MDN 说明](https://developer.mozilla.org/en-US/docs/Web/API/Service_Worker_API/Using_Service_Workers)。
 
 ## API（供二次开发）
@@ -123,15 +122,18 @@ IPv4 重签服务证书、重启代理并更新动态端点文件。以下是手
 | `POST /mobile-api/login` | `{token}` 配对，并签发 HttpOnly Cookie；本机二维码的 token 只能使用一次。 |
 | `POST /mobile-api/logout` | 使本设备 Cookie 失效。 |
 | `GET /mobile-api/state` | 手机范围内的会话、SSH、工作区选项及队列/工具/待确认状态。 |
+| `GET /mobile-api/search?query=` | 通过 Harness 正式搜索接口查找中英文消息正文；结果仍受手机会话范围限制。 |
 | `POST /mobile-api/workspace` | `{workspaceId}` 或 `{workspaceId:null}`，更新本次手机连接中新会话的默认工作区。 |
 | `POST /mobile-api/create-session` | 创建并登记为手机会话。 |
+| `POST /mobile-api/rename-session` | `{sessionId,title}`，通过 Harness 正式接口设置持久会话标题。 |
+| `POST /mobile-api/archive-session` | `{sessionId}`，从普通工作区分组归档会话；保留日志和工作区文件。 |
 | `POST /mobile-api/prompt` / `cancel` | 仅操作手机范围内的 `sessionId`。 |
 | `POST /mobile-api/respond` | 回传当前会话仍待处理的提问或工具许可；服务端校验 `rpcId`，不接受过期请求。 |
 | `GET /mobile-api/attachment?sessionId=&attachmentId=` | 在会话范围内读取已持久化的图片附件。 |
 | `GET /mobile-api/history?sessionId=` | 仅返回手机范围内的会话历史。 |
 | `GET /mobile-api/session-controls?sessionId=` | 返回该会话可用的权限预设、Agent 模式、模型与受限命令目录。 |
 | `POST /mobile-api/queue` | 编辑、删除或把一条仍在排队的文本消息严格插话到当前轮次。 |
-| `POST /mobile-api/fork` | `{sessionId, atSeq}`，从已完成回答所在轮次创建新会话分支。 |
+| `POST /mobile-api/fork` | `{sessionId, atSeq?}`；有 `atSeq` 时从指定已完成回答分支，省略时从最新完整状态分支。 |
 | `POST /mobile-api/permission` / `model` / `agent-preset` | 通过 Host 正式接口更新当前会话控制项。 |
 | `POST /mobile-api/ssh` | `{host, command, timeoutMs?, workdir?}`；`host` 必须在 `sshAliases` 中。 |
 | `GET /mobile-api/events` | 仅转发手机范围内会话的 SSE 事件。 |
@@ -153,6 +155,7 @@ npm audit --omit=dev
 | 文件 | 职责 |
 | --- | --- |
 | `lib/index.js` | 一次性二维码、API 配对、Cookie 会话、会话/SSH 范围和 PWA 静态服务。 |
+| `client.js` | 3080 设置左栏中的“手机端”页面，仅保存无凭据的手机偏好。 |
 | `dist/` | App 外壳、聊天、SSH、设置、Service Worker 与图标。 |
 | `scripts/lan-proxy.mjs` | TLS 局域网反向代理。 |
 | `test/smoke.mjs` | API、范围隔离、认证和 SSE 冒烟测试。 |

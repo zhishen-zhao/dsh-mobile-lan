@@ -4,8 +4,8 @@ import java.net.URI
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
 
-/** A pairing secret is parsed in memory and never persisted by the app. */
-data class PairingUri(val server: URI, val token: String)
+/** The one-time token stays in memory; the public certificate pin is persisted with the device session. */
+data class PairingUri(val server: URI, val token: String, val certificateSha256: String)
 
 class PairingUriException(message: String) : IllegalArgumentException(message)
 
@@ -23,7 +23,10 @@ object PairingUriParser {
         val query = decodeQuery(uri.rawQuery)
         val serverText = query["server"] ?: throw PairingUriException("配对码缺少服务器地址")
         val token = query["token"] ?: throw PairingUriException("配对码缺少配对密钥")
+        val certificateSha256 = query["certSha256"]?.lowercase()
+            ?: throw PairingUriException("配对码缺少 TLS 证书指纹，请更新电脑端插件")
         if (token.toByteArray(StandardCharsets.UTF_8).size < 32) throw PairingUriException("配对密钥长度不足")
+        if (!certificateSha256.matches(Regex("^[0-9a-f]{64}$"))) throw PairingUriException("TLS 证书指纹无效")
 
         val server = try {
             URI(serverText)
@@ -37,7 +40,7 @@ object PairingUriParser {
             throw PairingUriException("服务器地址包含不允许的字段")
         }
         if (server.path.isNotEmpty() && server.path != "/") throw PairingUriException("服务器地址不能包含路径")
-        return PairingUri(server, token)
+        return PairingUri(server, token, certificateSha256)
     }
 
     private fun decodeQuery(rawQuery: String?): Map<String, String> {

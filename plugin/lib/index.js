@@ -17,6 +17,8 @@ import z from "@deepseek-ai/schemastery";
 import QRCode from "qrcode";
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { readFileSync, statSync } from "node:fs";
+import { connect } from "node:net";
+import { homedir } from "node:os";
 import { extname, join, normalize, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -27,10 +29,12 @@ const Config = z.object({
 	/** Legacy inline token; only honored with allowInlineAccessToken: true. */
 	accessToken: z.string().default(""),
 	/** Environment variable containing the long-lived pairing secret. */
-	accessTokenEnv: z.string(),
+	accessTokenEnv: z.string().default("DSH_MOBILE_PAIRING_TOKEN"),
 	allowInlineAccessToken: z.boolean().default(false),
 	/** HTTPS origin embedded in a QR code rendered only at localhost/mobile-pair. */
 	pairingServerUrl: z.string().default(""),
+	/** SHA-256 fingerprint of the current LAN TLS leaf certificate. */
+	pairingCertificateSha256: z.string().default(""),
 	/** Optional JSON state file read on every pairing-page request. */
 	pairingServerUrlFile: z.string().default(""),
 	localPairingQrTtlMs: z.natural().min(60000).max(900000).default(300000),
@@ -52,6 +56,24 @@ const Config = z.object({
 	/** Require HTTPS (or a trusted TLS proxy's X-Forwarded-Proto header). */
 	requireSecureTransport: z.boolean().default(true)
 });
+
+/** Browser-editable preferences only; pairing secrets, URL origins, scopes, and SSH allowlists remain deployment-owned. */
+const MOBILE_SETTINGS_NAMESPACE = "mobile-remote";
+const MobileSettingsSchema = z.object({
+	title: z.string().min(1).max(80).default("DSH 远程控制"),
+	maxHistoryMessages: z.natural().min(1).max(500).default(80),
+	sessionTtlMs: z.natural().min(300000).max(604800000).default(604800000),
+	allowWorkspaceSelection: z.boolean().default(true)
+});
+
+function mobileSettingsBase(config) {
+	return {
+		title: typeof config.title === "string" && config.title.length > 0 ? config.title : "DSH 远程控制",
+		maxHistoryMessages: Number.isSafeInteger(config.maxHistoryMessages) ? config.maxHistoryMessages : 80,
+		sessionTtlMs: Number.isSafeInteger(config.sessionTtlMs) ? config.sessionTtlMs : 604800000,
+		allowWorkspaceSelection: config.allowWorkspaceSelection !== false
+	};
+}
 
 const MIME = {
 	".html": "text/html; charset=utf-8",
@@ -77,6 +99,33 @@ function parsePairingServerOrigin(value, source) {
 	} catch {
 		throw new Error(`mobile-remote: ${source} must be an HTTPS origin without a path, query, fragment, or credentials`);
 	}
+}
+
+function parseCertificateSha256(value, source) {
+	if (typeof value !== "string" || !/^[0-9a-f]{64}$/i.test(value.trim())) {
+		throw new Error(`mobile-remote: ${source} must be a 64-character SHA-256 certificate fingerprint`);
+	}
+	return value.trim().toLowerCase();
+}
+
+/** Refuse to mint a QR code while the advertised LAN listener is absent. */
+function requirePairingEndpointReady(origin, timeoutMs = 1500) {
+	const endpoint = new URL(origin);
+	const port = endpoint.port.length > 0 ? Number(endpoint.port) : 443;
+	return new Promise((resolvePromise, rejectPromise) => {
+		let settled = false;
+		const socket = connect({ host: endpoint.hostname, port });
+		const finish = (error) => {
+			if (settled) return;
+			settled = true;
+			socket.destroy();
+			if (error === void 0) resolvePromise();
+			else rejectPromise(new Error(`局域网 TLS 代理尚未监听 ${endpoint.host}；请启动 scripts/start-mobile-lan.ps1 后重试。`));
+		};
+		socket.setTimeout(timeoutMs, () => finish(new Error("timeout")));
+		socket.once("connect", () => finish());
+		socket.once("error", finish);
+	});
 }
 
 function compactHistoryEntries(entries) {
@@ -250,17 +299,25 @@ function apply(ctx, config = {}) {
 	};
 	const token = resolveAccessToken();
 	if (token.length > 0 && Buffer.byteLength(token, "utf8") < 32) throw new Error("mobile-remote: access token must be at least 32 bytes; configure accessTokenEnv with a random secret");
-	const title = typeof config.title === "string" ? config.title : "DSH 远程控制";
-	const maxHistoryMessages = Number.isSafeInteger(config.maxHistoryMessages) ? config.maxHistoryMessages : 80;
+	let { title, maxHistoryMessages, sessionTtlMs, allowWorkspaceSelection } = mobileSettingsBase(config);
 	const maxPromptBytes = Number.isSafeInteger(config.maxPromptBytes) ? config.maxPromptBytes : 8192;
 	const maxSshTimeoutMs = Number.isSafeInteger(config.maxSshTimeoutMs) ? config.maxSshTimeoutMs : 300000;
-	const sessionTtlMs = Number.isSafeInteger(config.sessionTtlMs) ? config.sessionTtlMs : 604800000;
 	const localPairingQrTtlMs = Number.isSafeInteger(config.localPairingQrTtlMs) ? config.localPairingQrTtlMs : 300000;
 	const requireSecureTransport = config.requireSecureTransport ?? true;
 	const allowExistingSessions = config.allowExistingSessions === true;
 	const workspaceId = typeof config.workspaceId === "string" && config.workspaceId.length > 0 ? config.workspaceId : void 0;
 	const configuredWorkspaceIds = Array.isArray(config.workspaceIds) ? config.workspaceIds.filter((id) => typeof id === "string" && id.trim().length > 0).map((id) => id.trim()) : [];
-	const allowWorkspaceSelection = config.allowWorkspaceSelection !== false;
+	ctx.inject(["settings"], (settingsCtx) => {
+		const scope = settingsCtx.settings.register(MOBILE_SETTINGS_NAMESPACE, MobileSettingsSchema, { base: mobileSettingsBase(config) });
+		const applyPreferences = (next) => {
+			title = next.title;
+			maxHistoryMessages = next.maxHistoryMessages;
+			sessionTtlMs = next.sessionTtlMs;
+			allowWorkspaceSelection = next.allowWorkspaceSelection;
+		};
+		applyPreferences(scope.get());
+		return scope.watch((next) => { applyPreferences(next); });
+	});
 	if (!Number.isSafeInteger(maxHistoryMessages) || maxHistoryMessages < 1 || maxHistoryMessages > 500) throw new Error("mobile-remote: maxHistoryMessages must be an integer between 1 and 500");
 	if (!Number.isSafeInteger(maxPromptBytes) || maxPromptBytes < 256 || maxPromptBytes > 65536) throw new Error("mobile-remote: maxPromptBytes must be an integer between 256 and 65536");
 	if (!Number.isSafeInteger(maxSshTimeoutMs) || maxSshTimeoutMs < 1000 || maxSshTimeoutMs > 300000) throw new Error("mobile-remote: maxSshTimeoutMs must be an integer between 1000 and 300000");
@@ -274,15 +331,27 @@ function apply(ctx, config = {}) {
 	if (typeof config.pairingServerUrl === "string" && config.pairingServerUrl.trim().length > 0) {
 		configuredPairingServerUrl = parsePairingServerOrigin(config.pairingServerUrl, "pairingServerUrl");
 	}
-	const pairingServerUrlFile = typeof config.pairingServerUrlFile === "string" && config.pairingServerUrlFile.trim().length > 0 ? config.pairingServerUrlFile.trim() : void 0;
+	let configuredPairingCertificateSha256;
+	if (typeof config.pairingCertificateSha256 === "string" && config.pairingCertificateSha256.trim().length > 0) {
+		configuredPairingCertificateSha256 = parseCertificateSha256(config.pairingCertificateSha256, "pairingCertificateSha256");
+	}
+	const pairingServerUrlFile = typeof config.pairingServerUrlFile === "string" && config.pairingServerUrlFile.trim().length > 0
+		? config.pairingServerUrlFile.trim()
+		: join(homedir(), ".dsh", "mobile-endpoint.json");
 	if (pairingServerUrlFile?.includes("\0")) throw new Error("mobile-remote: pairingServerUrlFile contains an invalid null character");
-	const resolvePairingServerUrl = () => {
-		if (pairingServerUrlFile === void 0) return configuredPairingServerUrl;
+	const resolvePairingServerState = () => {
+		if (pairingServerUrlFile === void 0) {
+			if (configuredPairingServerUrl === void 0) return void 0;
+			if (configuredPairingCertificateSha256 === void 0) throw new Error("mobile-remote: pairingCertificateSha256 is required when pairingServerUrlFile is not used");
+			return { origin: configuredPairingServerUrl, certificateSha256: configuredPairingCertificateSha256 };
+		}
 		let bytes;
 		try {
 			bytes = readFileSync(pairingServerUrlFile);
 		} catch (error) {
-			if (error?.code === "ENOENT" && configuredPairingServerUrl !== void 0) return configuredPairingServerUrl;
+			if (error?.code === "ENOENT" && configuredPairingServerUrl !== void 0 && configuredPairingCertificateSha256 !== void 0) {
+				return { origin: configuredPairingServerUrl, certificateSha256: configuredPairingCertificateSha256 };
+			}
 			throw new Error(`mobile-remote: cannot read pairingServerUrlFile: ${error instanceof Error ? error.message : String(error)}`);
 		}
 		if (bytes.length > 4096) throw new Error("mobile-remote: pairingServerUrlFile exceeds 4096 bytes");
@@ -293,7 +362,10 @@ function apply(ctx, config = {}) {
 			throw new Error("mobile-remote: pairingServerUrlFile is not valid JSON");
 		}
 		if (state === null || typeof state !== "object" || Array.isArray(state)) throw new Error("mobile-remote: pairingServerUrlFile must contain a JSON object");
-		return parsePairingServerOrigin(state.pairingServerUrl, "pairingServerUrlFile.pairingServerUrl");
+		return {
+			origin: parsePairingServerOrigin(state.pairingServerUrl, "pairingServerUrlFile.pairingServerUrl"),
+			certificateSha256: parseCertificateSha256(state.certificateSha256, "pairingServerUrlFile.certificateSha256")
+		};
 	};
 	const distDir = fileURLToPath(new URL("../dist/", import.meta.url));
 	const vendorAssets = new Map([
@@ -355,15 +427,29 @@ function apply(ctx, config = {}) {
 			authenticatedSessions.delete(key);
 			return void 0;
 		}
+		record.lastSeenAt = Date.now();
 		return record;
 	};
 	const sessionExpiresAt = (req) => sessionRecord(req)?.expiresAt;
 	const sessionOf = (req) => sessionRecord(req) !== void 0;
 	const cookie = (value, maxAge, secure) => `${sessionCookieName}=${encodeURIComponent(value)}; HttpOnly; Max-Age=${maxAge}; Path=/mobile-api; SameSite=Strict${secure ? "; Secure" : ""}`;
-	const startSession = (res, secure) => {
+	const startSession = (req, res, secure, requestedDeviceName) => {
+		const now = Date.now();
+		for (const [key, record] of authenticatedSessions) if (record.expiresAt <= now) authenticatedSessions.delete(key);
+		while (authenticatedSessions.size >= 32) authenticatedSessions.delete(authenticatedSessions.keys().next().value);
 		const value = randomBytes(32).toString("base64url");
-		const expiresAt = Date.now() + sessionTtlMs;
-		authenticatedSessions.set(sha256(value), { expiresAt, workspaceId });
+		const expiresAt = now + sessionTtlMs;
+		const suppliedName = typeof requestedDeviceName === "string" ? requestedDeviceName.trim().replace(/\s+/g, " ").slice(0, 80) : "";
+		const userAgent = String(req.headers["user-agent"] ?? "").slice(0, 160);
+		authenticatedSessions.set(sha256(value), {
+			id: randomBytes(9).toString("base64url"),
+			deviceName: suppliedName || "已配对设备",
+			userAgent,
+			createdAt: now,
+			lastSeenAt: now,
+			expiresAt,
+			workspaceId
+		});
 		res.setHeader("set-cookie", cookie(value, Math.floor(sessionTtlMs / 1000), secure));
 		return expiresAt;
 	};
@@ -373,6 +459,18 @@ function apply(ctx, config = {}) {
 		res.setHeader("set-cookie", cookie("", 0, isSecureTransport(req)));
 	};
 	const sessionAllowed = (sessionId) => allowExistingSessions || mobileSessions.has(sessionId);
+	const pairedDeviceViews = () => {
+		const now = Date.now();
+		const devices = [];
+		for (const [key, record] of authenticatedSessions) {
+			if (record.expiresAt <= now) {
+				authenticatedSessions.delete(key);
+				continue;
+			}
+			devices.push({ id: record.id, name: record.deviceName, createdAt: record.createdAt, lastSeenAt: record.lastSeenAt, expiresAt: record.expiresAt });
+		}
+		return devices.sort((a, b) => b.lastSeenAt - a.lastSeenAt);
+	};
 	const runtimeFor = (sessionId) => {
 		let runtime = sessionRuntime.get(sessionId);
 		if (runtime === void 0) {
@@ -434,28 +532,110 @@ function apply(ctx, config = {}) {
 		res.end(entry.body);
 	}
 
+	const createLocalPairingQr = async () => {
+		const pairingState = resolvePairingServerState();
+		if (pairingState === void 0) throw new Error("mobile pairing server URL is not configured");
+		const { origin: pairingServerUrl, certificateSha256 } = pairingState;
+		await requirePairingEndpointReady(pairingServerUrl);
+		const oneTimeToken = issueLocalPairingCode();
+		const pairingUri = `dshmobile://pair?server=${encodeURIComponent(pairingServerUrl)}&token=${encodeURIComponent(oneTimeToken)}&certSha256=${certificateSha256}`;
+		const svg = await QRCode.toString(pairingUri, { type: "svg", errorCorrectionLevel: "M", margin: 2 });
+		return {
+			pairingServerUrl,
+			certificateSha256,
+			expiresAt: Date.now() + localPairingQrTtlMs,
+			expiresMinutes: Math.ceil(localPairingQrTtlMs / 60000),
+			qrDataUrl: `data:image/svg+xml;base64,${Buffer.from(svg, "utf8").toString("base64")}`,
+			svg
+		};
+	};
+
+	const sendPairingUnavailable = (res, error) => sendJson(res, 503, {
+		ok: false,
+		error: error instanceof Error ? error.message : String(error),
+		hint: "局域网端点尚未就绪；请启动 scripts/start-mobile-lan.ps1 后刷新本页。"
+	});
+
 	const serveLocalPairingQr = async (req, res) => {
 		// The long-lived root token is never rendered. This page exists only on
 		// the desktop loopback origin and creates a short-lived, single-use code.
 		if (!isLoopbackRequest(req) || token.length === 0) {
 			return sendJson(res, 404, { ok: false, error: "not found" });
 		}
-		let pairingServerUrl;
+		let pairing;
 		try {
-			pairingServerUrl = resolvePairingServerUrl();
+			pairing = await createLocalPairingQr();
 		} catch (error) {
-			return sendJson(res, 503, { ok: false, error: error instanceof Error ? error.message : String(error), hint: "局域网端点尚未就绪；请启动 scripts/start-mobile-lan.ps1 后刷新本页。" });
+			return sendPairingUnavailable(res, error);
 		}
-		if (pairingServerUrl === void 0) return sendJson(res, 503, { ok: false, error: "mobile pairing server URL is not configured", hint: "请配置 pairingServerUrlFile 或 pairingServerUrl。" });
-		const oneTimeToken = issueLocalPairingCode();
-		const pairingUri = `dshmobile://pair?server=${encodeURIComponent(pairingServerUrl)}&token=${encodeURIComponent(oneTimeToken)}`;
-		const svg = await QRCode.toString(pairingUri, { type: "svg", errorCorrectionLevel: "M", margin: 2 });
-		const expiresMinutes = Math.ceil(localPairingQrTtlMs / 60000);
+		const { pairingServerUrl, certificateSha256, expiresMinutes, svg } = pairing;
 		const sessionDays = Math.max(1, Math.ceil(sessionTtlMs / 86400000));
 		const safeTitle = escapeHtml(title);
 		const safeServer = escapeHtml(pairingServerUrl);
-		const page = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light"><meta name="theme-color" content="#f5f6f8"><link rel="stylesheet" href="/mobile/pair.css"><link rel="icon" href="/mobile/icon-192.png" type="image/png"><title>${safeTitle} · 配对手机</title></head><body><main class="pair-shell"><header class="brand"><span class="brand-name">deepseek</span><span class="brand-tag">HARNESS</span><span class="local-pill"><i></i>仅限本机</span></header><section class="pair-card"><div class="copy"><p class="eyebrow">DSH MOBILE</p><h1>把 Harness 安全带到手机上</h1><p class="lead">打开 Android App 扫描二维码，即可查看会话、发送任务并接收实时输出。</p><ol><li><b>打开 DSH Mobile</b><span>点击“扫描电脑二维码”</span></li><li><b>扫描右侧二维码</b><span>一次性使用，约 ${expiresMinutes} 分钟后失效</span></li><li><b>开始远程工作</b><span>配对后最长保持 ${sessionDays} 天</span></li></ol></div><div class="qr-column"><div class="qr-frame">${svg}</div><p class="scan-label">使用 DSH Mobile 扫描</p><code>${safeServer}</code></div></section><aside class="security-note"><span>◆</span><p><b>本地安全边界</b><br>本页仅由 <code>localhost</code> 提供；二维码不包含长期密钥。Harness 重启、主动断开或会话到期后需要重新配对。</p></aside><footer>DSH Mobile · 单用户局域网遥控</footer></main></body></html>`;
+		const page = `<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="color-scheme" content="light"><meta name="theme-color" content="#f5f6f8"><link rel="stylesheet" href="/mobile/pair.css"><link rel="icon" href="/mobile/icon-192.png" type="image/png"><title>${safeTitle} · 配对手机</title></head><body><main class="pair-shell"><header class="brand"><span class="brand-name">deepseek</span><span class="brand-tag">HARNESS</span><span class="local-pill"><i></i>仅限本机</span></header><section class="pair-card"><div class="copy"><p class="eyebrow">DSH MOBILE</p><h1>把 Harness 安全带到手机上</h1><p class="lead">打开 Android App 扫描二维码，即可查看会话、发送任务并接收实时输出。</p><ol><li><b>打开 DSH Mobile</b><span>点击“扫描电脑二维码”</span></li><li><b>扫描右侧二维码</b><span>一次性使用，约 ${expiresMinutes} 分钟后失效</span></li><li><b>开始远程工作</b><span>配对后最长保持 ${sessionDays} 天</span></li></ol></div><div class="qr-column"><div class="qr-frame">${svg}</div><p class="scan-label">使用 DSH Mobile 扫描</p><code>${safeServer}</code><small>证书 ${certificateSha256.slice(0, 12)}…</small></div></section><aside class="security-note"><span>◆</span><p><b>本地安全边界</b><br>本页仅由 <code>localhost</code> 提供；二维码携带短时配对码和当前证书指纹，不包含长期密钥。Harness 重启、主动断开或会话到期后需要重新配对。</p></aside><footer>DSH Mobile · 单用户局域网遥控</footer></main></body></html>`;
 		sendHtml(res, 200, page);
+	};
+
+	const serveLocalPairingQrJson = async (req, res) => {
+		if (!isLoopbackRequest(req) || token.length === 0) {
+			return sendJson(res, 404, { ok: false, error: "not found" });
+		}
+		try {
+			const pairing = await createLocalPairingQr();
+			return sendJson(res, 200, {
+				ok: true,
+				qrDataUrl: pairing.qrDataUrl,
+				serverUrl: pairing.pairingServerUrl,
+				certificateSha256: pairing.certificateSha256,
+				expiresAt: pairing.expiresAt,
+				expiresMinutes: pairing.expiresMinutes
+			});
+		} catch (error) {
+			return sendPairingUnavailable(res, error);
+		}
+	};
+
+	const serveLocalMobileAdmin = async (req, res) => {
+		if (!isLoopbackRequest(req)) return sendJson(res, 404, { ok: false, error: "not found" });
+		const url = new URL(req.url ?? "/", "http://x");
+		const path = url.pathname.slice("/mobile-admin".length) || "/status";
+		if (req.method === "GET" && path === "/status") {
+			let endpoint;
+			let endpointError;
+			let ready = false;
+			try {
+				endpoint = resolvePairingServerState();
+				if (endpoint !== void 0) {
+					await requirePairingEndpointReady(endpoint.origin, 700);
+					ready = true;
+				}
+			} catch (error) {
+				endpointError = error instanceof Error ? error.message : String(error);
+			}
+			return sendJson(res, 200, {
+				ok: true,
+				tokenConfigured: token.length > 0,
+				tlsProxy: {
+					configured: endpoint !== void 0,
+					ready,
+					serverUrl: endpoint?.origin,
+					certificateSha256: endpoint?.certificateSha256,
+					error: endpointError
+				},
+				devices: pairedDeviceViews()
+			});
+		}
+		if (req.method === "POST" && (path === "/revoke" || path === "/revoke-all")) {
+			if (req.headers["x-dsh-mobile-admin"] !== "1") return sendJson(res, 403, { ok: false, error: "missing local admin request marker" });
+			const body = await readJsonBody(req, 16384);
+			if (path === "/revoke-all") authenticatedSessions.clear();
+			else {
+				if (typeof body.deviceId !== "string" || body.deviceId.length === 0) return sendJson(res, 400, { ok: false, error: "deviceId is required" });
+				for (const [key, record] of authenticatedSessions) if (record.id === body.deviceId) authenticatedSessions.delete(key);
+			}
+			return sendJson(res, 200, { ok: true, devices: pairedDeviceViews() });
+		}
+		return sendJson(res, 404, { ok: false, error: "not found" });
 	};
 
 	// ── live event fan-out (SSE) ─────────────────────────────────────────────
@@ -695,7 +875,7 @@ function apply(ctx, config = {}) {
 		if (req.method === "POST" && path === "/login") {
 			if (token.length === 0) return sendJson(res, 401, { ok: false, error: "mobile-remote: accessTokenEnv is not configured, API is disabled" });
 			if (typeof body.token !== "string" || (!pairingTokenMatches(body.token) && !consumeLocalPairingCode(body.token))) return sendJson(res, 401, { ok: false, error: "unauthorized: wrong pairing token" });
-			const expiresAt = startSession(res, secure);
+			const expiresAt = startSession(req, res, secure, body.deviceName);
 			return sendJson(res, 200, { ok: true, expiresInMs: sessionTtlMs, expiresAt });
 		}
 		if (!sessionOf(req)) {
@@ -745,9 +925,42 @@ function apply(ctx, config = {}) {
 					sessionScope: allowExistingSessions ? "all" : "mobile"
 				});
 			}
+			if (req.method === "GET" && path === "/search") {
+				const query = url.searchParams.get("query")?.trim() ?? "";
+				if (query.length === 0 || query.length > 500 || query.includes("\0")) return sendJson(res, 400, { ok: false, error: "search query must contain 1 to 500 visible characters" });
+				if (typeof ctx.apiProxy.sessions?.search !== "function") throw new Error("Harness session search API is unavailable");
+				const controller = new AbortController();
+				const abortSearch = () => controller.abort();
+				req.once("aborted", abortSearch);
+				let found;
+				try {
+					found = await call(ctx.apiProxy.sessions.search, { query }, controller.signal);
+				} finally {
+					req.off("aborted", abortSearch);
+				}
+				const items = (Array.isArray(found.items) ? found.items : []).filter((item) => sessionAllowed(item.sessionId)).map((item) => ({
+					sessionId: item.sessionId,
+					snippet: typeof item.snippet === "string" ? item.snippet : ""
+				}));
+				return sendJson(res, 200, { ok: true, items, hasMore: found.hasMore === true });
+			}
 			if (req.method === "POST" && path === "/workspace") {
 				const workspace = await setDefaultWorkspace(req, body.workspaceId ?? null);
 				return sendJson(res, 200, { ok: true, workspace });
+			}
+			if (req.method === "POST" && path === "/archive-session") {
+				const sessionId = requireMobileSession(body.sessionId);
+				if (typeof ctx.apiProxy.workspace?.archiveSession !== "function") throw new Error("Harness workspace archive API is unavailable");
+				const archived = await call(ctx.apiProxy.workspace.archiveSession, { sessionId });
+				return sendJson(res, 200, { ok: true, archivedSessionIds: archived.archivedSessionIds ?? [] });
+			}
+			if (req.method === "POST" && path === "/rename-session") {
+				const sessionId = requireMobileSession(body.sessionId);
+				if (typeof body.title !== "string" || body.title.trim().length === 0) return sendJson(res, 400, { ok: false, error: "session title must contain visible characters" });
+				if (Buffer.byteLength(body.title, "utf8") > 512) return sendJson(res, 400, { ok: false, error: "session title exceeds the 512-byte limit" });
+				if (typeof ctx.apiProxy.sessions?.rename !== "function") throw new Error("Harness session rename API is unavailable");
+				const renamed = await call(ctx.apiProxy.sessions.rename, { sessionId, title: body.title });
+				return sendJson(res, 200, { ok: true, title: renamed.title, seq: renamed.seq });
 			}
 			if (req.method === "POST" && path === "/create-session") {
 				const workspace = await visibleWorkspaces(req);
@@ -942,8 +1155,8 @@ function apply(ctx, config = {}) {
 			}
 			if (req.method === "POST" && path === "/fork") {
 				const sessionId = requireMobileSession(body.sessionId);
-				if (!Number.isSafeInteger(body.atSeq) || body.atSeq < 0) return sendJson(res, 400, { ok: false, error: "fork needs a non-negative message event sequence" });
-				const forked = await call(ctx.apiProxy.sessions.fork, { sessionId, atSeq: body.atSeq });
+				if (body.atSeq !== void 0 && (!Number.isSafeInteger(body.atSeq) || body.atSeq < 0)) return sendJson(res, 400, { ok: false, error: "fork atSeq must be a non-negative message event sequence" });
+				const forked = await call(ctx.apiProxy.sessions.fork, { sessionId, ...body.atSeq !== void 0 ? { atSeq: body.atSeq } : {} });
 				mobileSessions.add(forked.sessionId);
 				return sendJson(res, 200, { ok: true, sessionId: forked.sessionId });
 			}
@@ -1013,6 +1226,8 @@ function apply(ctx, config = {}) {
 
 	ctx.effect(() => {
 		const disposePairing = ctx.webServer.register({ kind: "exact", path: "/mobile-pair", handler: serveLocalPairingQr });
+		const disposePairingJson = ctx.webServer.register({ kind: "exact", path: "/mobile-pair.json", handler: serveLocalPairingQrJson });
+		const disposeMobileAdmin = ctx.webServer.register({ kind: "prefix", path: "/mobile-admin", handler: serveLocalMobileAdmin });
 		const disposeRoute = ctx.webServer.register({ kind: "prefix", path: "/mobile-api", handler: handleApi });
 		const disposeApp = ctx.webServer.register({ kind: "prefix", path: "/mobile", handler: (req, res) => {
 			const url = new URL(req.url ?? "/", "http://x");
@@ -1022,6 +1237,8 @@ function apply(ctx, config = {}) {
 		const disposeIndex = ctx.webServer.register({ kind: "exact", path: "/mobile", handler: (_req, res) => serveAsset(res, "") });
 		return () => {
 			disposePairing();
+			disposePairingJson();
+			disposeMobileAdmin();
 			disposeRoute();
 			disposeApp();
 			disposeIndex();

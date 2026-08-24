@@ -19,14 +19,25 @@
 # shipped web profile). SSH execution reuses the `ssh` tool registered by
 # dsh-tool-ssh through the host tools registry — no credential duplication.
 
+# The stock Web profile deliberately disables full-text indexing with
+# `openAt: never`. Installing this mobile bundle is an explicit opt-in to
+# message-content search. Defer the cost until the first search and keep the
+# derived index ephemeral so no additional durable transcript database is
+# created by this plugin.
+- id: session-query-sqlite
+  config:
+    path: ':memory:'
+    openAt: first-search
+
 - insert:
     - id: mobile-remote
       name: 'dsh-mobile-remote'
       config:
         accessToken: ''
-        accessTokenEnv: ''
+        accessTokenEnv: DSH_MOBILE_PAIRING_TOKEN
         allowInlineAccessToken: false
         pairingServerUrl: ''
+        pairingCertificateSha256: ''
         pairingServerUrlFile: ''
         localPairingQrTtlMs: 300000
         title: 'DSH 远程控制'

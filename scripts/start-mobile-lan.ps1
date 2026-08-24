@@ -64,21 +64,40 @@ function Get-PrimaryLanIPv4 {
 
 function Write-EndpointState {
     param([string]$Address)
+    $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::CreateFromPem([IO.File]::ReadAllText($serverCertificate))
+    $certificateSha256 = [Convert]::ToHexString($certificate.GetCertHash([Security.Cryptography.HashAlgorithmName]::SHA256)).ToLowerInvariant()
     $temporaryPath = Join-Path $endpointDirectory ('.mobile-endpoint-{0}-{1}.tmp' -f $PID, [guid]::NewGuid().ToString('N'))
     $state = [ordered]@{
         schemaVersion = 1
         pairingServerUrl = "https://${Address}:$ListenPort"
         address = $Address
         port = $ListenPort
+        certificateSha256 = $certificateSha256
+        certificateExpiresAt = [DateTimeOffset]::new($certificate.NotAfter.ToUniversalTime()).ToString('o')
         updatedAt = [DateTimeOffset]::UtcNow.ToString('o')
     } | ConvertTo-Json
     [IO.File]::WriteAllText($temporaryPath, $state, [Text.UTF8Encoding]::new($false))
     Move-Item -LiteralPath $temporaryPath -Destination $endpointFullPath -Force
 }
 
+function Test-ReusableServerCertificate {
+    param([string]$Address)
+    if (-not (Test-Path -LiteralPath $serverCertificate -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $serverKey -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $endpointFullPath -PathType Leaf)) { return $false }
+    try {
+        $state = Get-Content -LiteralPath $endpointFullPath -Raw | ConvertFrom-Json
+        if ($state.address -ne $Address -or [int]$state.port -ne $ListenPort) { return $false }
+        $certificate = [Security.Cryptography.X509Certificates.X509Certificate2]::CreateFromPemFile($serverCertificate, $serverKey)
+        return $certificate.HasPrivateKey -and $certificate.NotAfter.ToUniversalTime() -gt [DateTime]::UtcNow.AddDays(7)
+    } catch {
+        return $false
+    }
+}
+
 function Start-HarnessProcess {
     if (Test-TcpPort -Address '127.0.0.1' -Port $TargetPort) { return $null }
-    if ($DoNotStartHarness) { throw "Harness is not listening on 127.0.0.1:$TargetPort." }
+    if ($DoNotStartHarness) { return $null }
 
     $dshCommand = Get-Command dsh -ErrorAction Stop
     $dshExecutable = $dshCommand.Source
@@ -139,23 +158,39 @@ function Start-ProxyProcess {
 $harnessProcess = $null
 $proxyProcess = $null
 $activeAddress = $null
+$harnessUnavailableNotified = $false
 
 try {
     $harnessProcess = Start-HarnessProcess
     Write-Host 'Watching the primary physical LAN adapter. Press Ctrl+C to stop.' -ForegroundColor Green
     while ($true) {
         if (-not (Test-TcpPort -Address '127.0.0.1' -Port $TargetPort)) {
+            if ($DoNotStartHarness) {
+                if (-not $harnessUnavailableNotified) {
+                    Write-Warning "Harness is not listening on 127.0.0.1:$TargetPort; keeping the LAN monitor alive and waiting."
+                    $harnessUnavailableNotified = $true
+                }
+                Start-Sleep -Seconds $PollSeconds
+                continue
+            }
             if ($null -ne $harnessProcess -and -not $harnessProcess.HasExited) {
                 Stop-Process -Id $harnessProcess.Id -Force -ErrorAction SilentlyContinue
             }
             $harnessProcess = Start-HarnessProcess
+        } elseif ($harnessUnavailableNotified) {
+            Write-Host "Harness is listening again on 127.0.0.1:$TargetPort; LAN proxy monitoring resumed." -ForegroundColor Green
+            $harnessUnavailableNotified = $false
         }
 
         $detectedAddress = Get-PrimaryLanIPv4
         $proxyStopped = $null -ne $proxyProcess -and $proxyProcess.HasExited
         if (-not [string]::IsNullOrWhiteSpace($detectedAddress) -and ($detectedAddress -ne $activeAddress -or $null -eq $proxyProcess -or $proxyStopped)) {
-            Write-Host "LAN endpoint changed to $detectedAddress; refreshing the leaf certificate and proxy ..." -ForegroundColor Cyan
-            & $tlsScript -HostName $detectedAddress -OutputDirectory $certDirectory
+            if (Test-ReusableServerCertificate -Address $detectedAddress) {
+                Write-Host "LAN endpoint is still $detectedAddress; reusing its pinned server certificate." -ForegroundColor Cyan
+            } else {
+                Write-Host "LAN endpoint changed to $detectedAddress; refreshing the leaf certificate and proxy ..." -ForegroundColor Cyan
+                & $tlsScript -HostName $detectedAddress -OutputDirectory $certDirectory -SkipAndroidCaSync
+            }
             if ($null -ne $proxyProcess -and -not $proxyProcess.HasExited) {
                 Stop-Process -Id $proxyProcess.Id -Force -ErrorAction SilentlyContinue
                 $proxyProcess.WaitForExit(5000)

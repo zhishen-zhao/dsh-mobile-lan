@@ -21,6 +21,7 @@ internal class SecureSessionStore(context: Context) {
             .put("server", session.server.toString())
             .put("cookie", session.cookie)
             .put("expiresAt", session.expiresAt)
+            .put("certificateSha256", session.certificateSha256)
             .toString()
             .toByteArray(Charsets.UTF_8)
         val cipher = Cipher.getInstance(TRANSFORMATION).apply {
@@ -48,6 +49,7 @@ internal class SecureSessionStore(context: Context) {
                 server = URI(json.getString("server")),
                 cookie = json.getString("cookie"),
                 expiresAt = json.getLong("expiresAt"),
+                certificateSha256 = json.getString("certificateSha256"),
             ).takeIf { it.expiresAt > System.currentTimeMillis() }
                 ?: run { clear(); null }
         } catch (_: Exception) {

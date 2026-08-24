@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <network-security-config>
-    <!-- The Android shell trusts only this computer's generated DSH CA. -->
+    <!-- Private LAN certificates are accepted only after an exact QR-delivered leaf pin match. -->
     <base-config cleartextTrafficPermitted="false">
         <trust-anchors>
-            <certificates src="@raw/dsh_mobile_local_ca" />
+            <certificates src="system" />
         </trust-anchors>
     </base-config>
 </network-security-config>

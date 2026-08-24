@@ -5,8 +5,7 @@ WebView 中呈现现有的 dsh 手机网页 UI；不要求在手机上配置 SSH
 
 ## 安全边界
 
-- 只接受 `https://` 服务器地址；只信任随此 App 打包的本机 DSH CA，并继续校验证书
-  SAN，不存在“忽略证书错误”或信任所有用户 CA 的降级开关。
+- 只接受 `https://` 服务器地址；二维码必须携带当前叶证书 SHA-256 指纹。原生登录精确校验该指纹、证书有效期和 SAN，WebView 只对同源且指纹完全一致的“未受信任私有 CA”错误放行，不信任任意用户 CA。
 - 配对二维码的 token 只提交给 `/mobile-api/login` 一次；不会写入偏好设置、数据库、
   剪贴板或 Android 备份。
 - 会话 Cookie 与到期时间使用 Android Keystore 的 AES-GCM 密钥加密保存；App 进程
@@ -20,12 +19,10 @@ WebView 中呈现现有的 dsh 手机网页 UI；不要求在手机上配置 SSH
 
 ## 运行前的电脑端准备
 
-1. 先在仓库根目录运行 `scripts/setup-local-tls.ps1 -HostName <局域网 IP 或 DNS>`，
-   为当前安装生成 CA 与服务证书；私钥和生成的 Android CA 均由 Git 忽略。
+1. 在仓库根目录运行 `scripts/install.ps1`，或手工运行 `scripts/setup-local-tls.ps1 -HostName <局域网 IP 或 DNS>` 生成本机 CA 与服务证书；全部私钥均由 Git 忽略。
 2. 在 `plugin` 的 web profile 配置 `pairingServerUrl` 为手机将访问的
    HTTPS 根地址，例如 `https://192.168.1.10:3080`。
-3. 用 `plugin/scripts/lan-proxy.mjs` 提供 TLS；证书 SAN 必须匹配该 IP 或 DNS 名称。当前
-   Android App 已固定本机 DSH CA，因此不需要在手机全局安装 CA；不要改用 HTTP。
+3. 用 `plugin/scripts/lan-proxy.mjs` 提供 TLS；证书 SAN 必须匹配该 IP 或 DNS 名称，动态端点文件必须包含证书 SHA-256 指纹。App 通过二维码绑定指纹，不需要安装全局 CA；不要改用 HTTP。
 4. 启动或重启 `dsh web` 后，在电脑本机打开
    `http://127.0.0.1:3080/mobile-pair`。页面只在回环地址提供，并生成最长 5 分钟、
    单次有效的二维码。

@@ -11,6 +11,7 @@
  */
 import assert from "node:assert/strict";
 import http from "node:http";
+import net from "node:net";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -44,6 +45,7 @@ ok("LAN proxy allowlists only the mobile surface and overwrites forwarding heade
 const calls = {
 	prompts: [],
 	responses: [],
+	forks: [],
 	ssh: []
 };
 const fakeSessions = [{
@@ -54,10 +56,15 @@ const fakeSessions = [{
 	cwd: "C:/x",
 	projections: { values: { title: "测试会话" } }
 }];
+let archivedSessionIds = [];
 const okResult = (request, value) => ({ rpcId: request.rpcId, result: { ok: true, value } });
 const fakeApiProxy = {
 	sessions: {
 		list: async (request) => okResult(request, { items: fakeSessions }),
+		search: async (request, signal) => {
+			assert.equal(signal instanceof AbortSignal, true);
+			return okResult(request, { items: request.payload.query.toLowerCase().includes("english") ? [{ sessionId: "s-new", snippet: "English text inside a message" }, { sessionId: "s1", snippet: "outside mobile scope" }] : [], hasMore: false });
+		},
 		create: async (request) => {
 			fakeSessions.push({ sessionId: "s-new", updatedAt: 2000, running: false, blank: true, cwd: "C:/x", agentPreset: "standard", projections: { values: { title: "新会话", permissions: { options: [{ value: "read-only", name: "read-only" }, { value: "workspace-write", name: "workspace-write" }, { value: "danger-full-access", name: "danger-full-access" }], currentValue: "workspace-write" } } } });
 			return okResult(request, { sessionId: "s-new", ...request.payload });
@@ -65,7 +72,17 @@ const fakeApiProxy = {
 		models: async (request) => okResult(request, { current: { provider: "test", model: "model-a", reasoningEffort: "high" }, routable: true, groups: [{ id: "test", name: "Test", models: [{ id: "model-a", name: "Model A", reasoning: { efforts: [{ id: "off", name: "Off" }, { id: "high", name: "High" }] } }] }], failures: [] }),
 		selectModel: async (request) => okResult(request, { selected: { provider: request.payload.provider, model: request.payload.model, reasoningEffort: request.payload.reasoningEffort } }),
 		updateQueue: async (request) => okResult(request, { accepted: true }),
-		fork: async (request) => { fakeSessions.push({ sessionId: "s-fork", updatedAt: 3000, running: false, blank: true, cwd: "C:/x", agentPreset: "standard", projections: { values: { title: "分支" } } }); return okResult(request, { sessionId: "s-fork" }); },
+		rename: async (request) => {
+			const session = fakeSessions.find((item) => item.sessionId === request.payload.sessionId);
+			if (session) session.projections.values.title = request.payload.title.trim();
+			return okResult(request, { title: request.payload.title.trim(), seq: 10 });
+		},
+		fork: async (request) => {
+			calls.forks.push(request.payload);
+			const sessionId = calls.forks.length === 1 ? "s-fork" : "s-whole-fork";
+			fakeSessions.push({ sessionId, updatedAt: 3000 + calls.forks.length, running: false, blank: true, cwd: "C:/x", agentPreset: "standard", projections: { values: { title: "分支" } } });
+			return okResult(request, { sessionId });
+		},
 		prompt: async (request) => {
 			calls.prompts.push(request.payload);
 			return okResult(request, { accepted: true });
@@ -92,7 +109,11 @@ const fakeApiProxy = {
 			sessionIds: [],
 			createdAt: "2026-01-01T00:00:00.000Z",
 			updatedAt: "2026-01-01T00:00:00.000Z"
-		}] })
+		}], archivedSessionIds }),
+		archiveSession: async (request) => {
+			if (!archivedSessionIds.includes(request.payload.sessionId)) archivedSessionIds = [...archivedSessionIds, request.payload.sessionId];
+			return okResult(request, { archivedSessionIds });
+		}
 	},
 	agentPresets: {
 		list: async (request) => okResult(request, { presets: [{ id: "standard", trust: "system", isDefault: true, name: "标准模式", description: "测试 Agent" }], authorable: false, hasDocument: false }),
@@ -249,8 +270,19 @@ async function main() {
 	const endpointRoot = mkdtempSync(join(tmpdir(), "dsh-mobile-endpoint-"));
 	tempRoots.push(endpointRoot);
 	const endpointFile = join(endpointRoot, "endpoint.json");
-	writeFileSync(endpointFile, JSON.stringify({ schemaVersion: 1, pairingServerUrl: "https://192.168.1.10:3080" }));
-	const bundle = makeContext({ accessToken: "0123456789abcdef0123456789abcdef", allowInlineAccessToken: true, requireSecureTransport: false, title: "测试遥控", pairingServerUrl: "https://192.168.1.9:3080", pairingServerUrlFile: endpointFile, sshAliases: ["dev"], workspaceId: "w1", workspaceIds: ["w1"], maxHistoryMessages: 80 });
+	const listenProbe = () => new Promise((resolvePromise) => {
+		const probe = net.createServer((socket) => socket.end());
+		openServers.push(probe);
+		probe.listen(0, "127.0.0.1", () => resolvePromise(probe));
+	});
+	const firstProbe = await listenProbe();
+	const secondProbe = await listenProbe();
+	const firstOrigin = `https://127.0.0.1:${firstProbe.address().port}`;
+	const secondOrigin = `https://127.0.0.1:${secondProbe.address().port}`;
+	const certificateSha256 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+	const endpointState = (origin) => ({ schemaVersion: 1, pairingServerUrl: origin, certificateSha256 });
+	writeFileSync(endpointFile, JSON.stringify(endpointState(firstOrigin)));
+	const bundle = makeContext({ accessToken: "0123456789abcdef0123456789abcdef", accessTokenEnv: "", allowInlineAccessToken: true, requireSecureTransport: false, title: "测试遥控", pairingServerUrl: firstOrigin, pairingCertificateSha256: certificateSha256, pairingServerUrlFile: endpointFile, sshAliases: ["dev"], workspaceId: "w1", workspaceIds: ["w1"], maxHistoryMessages: 80 });
 	const ctx = bundle.ctx;
 	const server = await listen(bundle);
 	const port = server.address().port;
@@ -296,8 +328,40 @@ async function main() {
 		assert.match(app.text, /closeMessageActions/);
 		assert.match(app.text, /本轮运行失败/);
 		assert.match(app.text, /reason\.kind === "error"/);
+		assert.match(app.text, /window\.DSHMobileBack = handleMobileBack/);
+		assert.match(app.text, /location\.href = "dshmobile:\/\/disconnect"/);
+		assert.match(app.text, /nativeDisconnecting/);
+		assert.match(app.text, /installDrawerSwipe/);
+		assert.match(app.text, /install\(chat, false/);
+		assert.match(app.text, /install\(drawer, true/);
+		assert.match(app.text, /const showProgress/);
+		assert.match(app.text, /velocityX/);
+		assert.doesNotMatch(app.text, /event\.clientX > 36/);
+		assert.match(app.text, /addEventListener\("touchstart"/);
+		assert.match(app.text, /addEventListener\("touchmove"/);
+		assert.match(app.text, /bindSessionLongPress/);
+		assert.match(app.text, /openRenameSessionSheet/);
+		assert.match(app.text, /sessionSort === "title-asc"/);
+		assert.match(app.text, /openSessionSortMenu/);
+		assert.match(app.text, /queueSessionSearch/);
+		assert.match(app.text, /compositionend/);
+		assert.match(app.text, /api\("\/search"/);
 		assert.doesNotMatch(app.text, /fork\.textContent = "⎇"/);
 		ok("GET /mobile/app.js serves the online-only client script");
+	}
+	{
+		const page = await request(server, port, "/mobile");
+		assert.doesNotMatch(page.text, /desktop-pet-section|id="btn-logout"/);
+		assert.match(page.text, /id="btn-logout-settings"/);
+		assert.match(page.text, /id="disconnect-layer"/);
+		assert.match(page.text, /id="session-search"/);
+		assert.match(page.text, /id="btn-session-sort"/);
+		assert.match(page.text, /id="session-sort-menu"/);
+		assert.match(page.text, /id="session-search-status"/);
+		assert.match(page.text, /inputmode="search"/);
+		assert.doesNotMatch(page.text, /<select id="session-sort"/);
+		assert.match(page.text, /id="archive-layer"/);
+		ok("mobile settings owns the confirmed disconnect action and excludes desktop-pet controls");
 	}
 	{
 		const marked = await request(server, port, "/mobile/vendor/marked.js");
@@ -316,6 +380,14 @@ async function main() {
 		assert.match(appCss.headers.get("content-type"), /text\/css/);
 		assert.match(appCss.text, /\.branch-action svg[^}]+stroke-width: 1\.55/);
 		assert.match(appCss.text, /\.message-actions \{ display: none/);
+		assert.match(appCss.text, /\.toast \{[^}]*top: calc\(64px \+ env\(safe-area-inset-top/);
+		assert.match(appCss.text, /\.session-item \{[^}]*touch-action: pan-y/);
+		assert.match(appCss.text, /-webkit-tap-highlight-color: transparent/);
+		assert.match(appCss.text, /\.native-android \.login \{ display: none !important; \}/);
+		assert.match(appCss.text, /\.session-item\.active \{[^}]*background: transparent/);
+		assert.match(appCss.text, /\.drawer-sort-menu \{[^}]*box-shadow: var\(--shadow\)/);
+		assert.match(appCss.text, /\.drawer\.dragging \{[^}]*transition: none/);
+		assert.match(appCss.text, /#drawer-scrim\.dragging \{[^}]*transition: none/);
 		ok("message branch action uses the thin vector icon style");
 	}
 	{
@@ -330,6 +402,7 @@ async function main() {
 		assert.equal(theme.status, 200);
 		assert.match(theme.headers.get("content-type"), /javascript/);
 		assert.match(theme.text, /dsh_mobile_theme/);
+		assert.match(theme.text, /classList\.add\("native-android"\)/);
 		assert.doesNotMatch(theme.text, /token|cookie/i);
 		ok("theme preference script stores no credentials");
 	}
@@ -356,26 +429,50 @@ async function main() {
 		ok("path traversal does not leak files");
 	}
 	{
+		const status = await request(server, port, "/mobile-admin/status");
+		assert.equal(status.status, 200);
+		assert.equal(status.json.tlsProxy.ready, true);
+		assert.equal(status.json.tlsProxy.certificateSha256, certificateSha256);
+		assert.deepEqual(status.json.devices, []);
+		ok("localhost mobile admin reports the current pinned TLS endpoint");
+	}
+	{
 		const page = await request(server, port, "/mobile-pair");
 		assert.equal(page.status, 200);
 		assert.match(page.headers.get("content-type"), /text\/html/);
 		assert.equal(page.headers.get("cache-control"), "no-store");
 		assert.match(page.text, /<svg/);
-		assert.match(page.text, /https:\/\/192\.168\.1\.10:3080/);
+		assert.match(page.text, new RegExp(firstOrigin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+		assert.match(page.text, new RegExp(certificateSha256.slice(0, 12)));
 		assert.doesNotMatch(page.text, /0123456789abcdef0123456789abcdef/);
 		ok("localhost pairing page renders a one-time QR without the root secret");
 	}
 	{
-		writeFileSync(endpointFile, JSON.stringify({ schemaVersion: 1, pairingServerUrl: "https://192.168.1.11:3080", updatedAt: new Date().toISOString() }));
+		const first = await request(server, port, "/mobile-pair.json");
+		assert.equal(first.status, 200);
+		assert.equal(first.json.ok, true);
+		assert.match(first.json.qrDataUrl, /^data:image\/svg\+xml;base64,/);
+		assert.equal(first.json.serverUrl, firstOrigin);
+		assert.equal(first.json.certificateSha256, certificateSha256);
+		assert.equal(typeof first.json.expiresAt, "number");
+		assert.equal(first.json.expiresMinutes, 5);
+		assert.doesNotMatch(JSON.stringify(first.json), /0123456789abcdef0123456789abcdef/);
+		const refreshed = await request(server, port, "/mobile-pair.json");
+		assert.equal(refreshed.status, 200);
+		assert.notEqual(refreshed.json.qrDataUrl, first.json.qrDataUrl);
+		ok("localhost settings route returns refreshable one-time pairing QR data without the root secret");
+	}
+	{
+		writeFileSync(endpointFile, JSON.stringify({ ...endpointState(secondOrigin), updatedAt: new Date().toISOString() }));
 		const refreshed = await request(server, port, "/mobile-pair");
 		assert.equal(refreshed.status, 200);
-		assert.match(refreshed.text, /https:\/\/192\.168\.1\.11:3080/);
-		assert.doesNotMatch(refreshed.text, /https:\/\/192\.168\.1\.10:3080/);
+		assert.match(refreshed.text, new RegExp(secondOrigin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+		assert.doesNotMatch(refreshed.text, new RegExp(firstOrigin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 		ok("pairing page refresh reads the current LAN endpoint from disk");
 	}
 	{
 		for (const badValue of ["http://192.168.1.11:3080", "https://user:pass@192.168.1.11:3080", "https://192.168.1.11:3080/mobile", "https://192.168.1.11:3080?token=x"]) {
-			writeFileSync(endpointFile, JSON.stringify({ pairingServerUrl: badValue }));
+			writeFileSync(endpointFile, JSON.stringify({ pairingServerUrl: badValue, certificateSha256 }));
 			const rejected = await request(server, port, "/mobile-pair");
 			assert.equal(rejected.status, 503);
 		}
@@ -385,16 +482,38 @@ async function main() {
 		ok("dynamic endpoint rejects HTTP, credentials, paths, queries, and corrupt JSON");
 	}
 	{
+		writeFileSync(endpointFile, JSON.stringify({ pairingServerUrl: firstOrigin, certificateSha256: "not-a-pin" }));
+		const rejected = await request(server, port, "/mobile-pair.json");
+		assert.equal(rejected.status, 503);
+		assert.match(rejected.json.error, /certificateSha256/);
+		ok("pairing rejects malformed TLS certificate fingerprints");
+	}
+	{
 		rmSync(endpointFile);
 		const fallback = await request(server, port, "/mobile-pair");
 		assert.equal(fallback.status, 200);
-		assert.match(fallback.text, /https:\/\/192\.168\.1\.9:3080/);
+		assert.match(fallback.text, new RegExp(firstOrigin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 		ok("missing endpoint state safely falls back to the configured HTTPS origin");
+	}
+	{
+		const unavailableProbe = await listenProbe();
+		const unavailableOrigin = `https://127.0.0.1:${unavailableProbe.address().port}`;
+		await new Promise((resolvePromise) => unavailableProbe.close(resolvePromise));
+		openServers.splice(openServers.indexOf(unavailableProbe), 1);
+		writeFileSync(endpointFile, JSON.stringify(endpointState(unavailableOrigin)));
+		const unavailable = await request(server, port, "/mobile-pair.json");
+		assert.equal(unavailable.status, 503);
+		assert.match(unavailable.json.error, /TLS 代理尚未监听/);
+		assert.match(unavailable.json.hint, /start-mobile-lan/);
+		rmSync(endpointFile);
+		ok("pairing QR stays unavailable until the advertised LAN TLS proxy is listening");
 	}
 	{
 		const blocked = await requestWithHost(port, "/mobile-pair", "192.168.1.10:3080");
 		assert.equal(blocked.status, 404);
-		ok("LAN host cannot retrieve the local pairing QR");
+		const jsonBlocked = await requestWithHost(port, "/mobile-pair.json", "192.168.1.10:3080");
+		assert.equal(jsonBlocked.status, 404);
+		ok("LAN host cannot retrieve local pairing QR data");
 	}
 
 	// ── token auth ──────────────────────────────────────────────────────────
@@ -414,12 +533,20 @@ async function main() {
 		ok("wrong pairing token → 401");
 	}
 	{
-		const paired = await request(server, port, "/mobile-api/login", { method: "POST", body: { token: "0123456789abcdef0123456789abcdef" } });
+		const paired = await request(server, port, "/mobile-api/login", { method: "POST", body: { token: "0123456789abcdef0123456789abcdef", deviceName: "测试手机" } });
 		assert.equal(paired.status, 200);
 		assert.match(paired.headers.get("set-cookie"), /HttpOnly/);
 		assert.match(paired.headers.get("set-cookie"), /SameSite=Strict/);
 		assert.match(request.cookie, /^dsh_mobile_session=/);
 		ok("pairing token creates an HttpOnly session cookie");
+	}
+	{
+		const status = await request(server, port, "/mobile-admin/status");
+		assert.equal(status.status, 200);
+		assert.equal(status.json.devices.length, 1);
+		assert.equal(status.json.devices[0].name, "测试手机");
+		assert.equal(status.json.devices[0].userAgent, undefined);
+		ok("localhost mobile admin lists paired devices without exposing session credentials");
 	}
 
 	// ── state ───────────────────────────────────────────────────────────────
@@ -434,6 +561,7 @@ async function main() {
 		assert.equal(state.json.workspace.defaultWorkspaceId, "w1");
 		assert.deepEqual(state.json.workspace.options, [{ workspaceId: "w1", title: "项目工作区", path: "C:/x", sessionIds: [] }]);
 		assert.equal(state.json.sessionScope, "mobile");
+		assert.equal(state.json.desktopPet, undefined);
 		assert.equal(typeof state.json.deviceSession.expiresAt, "number");
 		ok("state scopes sessions, SSH aliases, and workspace choices to the mobile app");
 	}
@@ -456,6 +584,13 @@ async function main() {
 		assert.equal(created.json.sessionId, "s-new");
 		assert.equal(created.json.workspaceId, "w1");
 		ok("create-session proxies sessions.create");
+	}
+	{
+		const searched = await request(server, port, "/mobile-api/search?query=English");
+		assert.equal(searched.status, 200);
+		assert.deepEqual(searched.json.items, [{ sessionId: "s-new", snippet: "English text inside a message" }]);
+		assert.equal(searched.json.hasMore, false);
+		ok("session content search supports English and filters results to mobile scope");
 	}
 	{
 		const controls = await request(server, port, "/mobile-api/session-controls?sessionId=s-new");
@@ -483,10 +618,33 @@ async function main() {
 		ok("queue snapshots expose text safely and queue edits use session.updateQueue");
 	}
 	{
+		const renamed = await request(server, port, "/mobile-api/rename-session", { method: "POST", body: { sessionId: "s-new", title: "手机端重命名" } });
+		assert.equal(renamed.status, 200);
+		assert.equal(renamed.json.title, "手机端重命名");
+		const refreshed = await request(server, port, "/mobile-api/state");
+		assert.equal(refreshed.json.sessions.find((item) => item.sessionId === "s-new")?.title, "手机端重命名");
+		ok("session rename uses the official durable session API");
+	}
+	{
 		const forked = await request(server, port, "/mobile-api/fork", { method: "POST", body: { sessionId: "s-new", atSeq: 5 } });
 		assert.equal(forked.status, 200);
 		assert.equal(forked.json.sessionId, "s-fork");
 		ok("message fork creates and admits the child session into mobile scope");
+	}
+	{
+		const forked = await request(server, port, "/mobile-api/fork", { method: "POST", body: { sessionId: "s-new" } });
+		assert.equal(forked.status, 200);
+		assert.equal(forked.json.sessionId, "s-whole-fork");
+		assert.equal(calls.forks.at(-1).atSeq, undefined);
+		ok("session action can fork the latest complete conversation without a message anchor");
+	}
+	{
+		const archived = await request(server, port, "/mobile-api/archive-session", { method: "POST", body: { sessionId: "s-fork" } });
+		assert.equal(archived.status, 200);
+		assert.deepEqual(archived.json.archivedSessionIds, ["s-fork"]);
+		const refreshed = await request(server, port, "/mobile-api/state");
+		assert.equal(refreshed.json.sessions.find((item) => item.sessionId === "s-fork")?.archived, true);
+		ok("session archive uses the official durable archive API");
 	}
 	{
 		const permission = await request(server, port, "/mobile-api/permission", { method: "POST", body: { sessionId: "s-new", preset: "read-only" } });
@@ -630,7 +788,7 @@ async function main() {
 
 	// ── disabled-token posture ──────────────────────────────────────────────
 	{
-		const lockedBundle = makeContext({ requireSecureTransport: false });
+		const lockedBundle = makeContext({ accessTokenEnv: "DSH_MOBILE_TEST_DISABLED", requireSecureTransport: false });
 		const lockedServer = await listen(lockedBundle);
 		const lockedPort = lockedServer.address().port;
 		const savedCookie = request.cookie;
@@ -644,7 +802,7 @@ async function main() {
 		ok("missing accessTokenEnv keeps the API closed with a config hint");
 	}
 	{
-		const tlsBundle = makeContext({ accessToken: "0123456789abcdef0123456789abcdef", allowInlineAccessToken: true, requireSecureTransport: true });
+		const tlsBundle = makeContext({ accessToken: "0123456789abcdef0123456789abcdef", accessTokenEnv: "", allowInlineAccessToken: true, requireSecureTransport: true });
 		const tlsServer = await listen(tlsBundle);
 		const tlsPort = tlsServer.address().port;
 		const response = await request(tlsServer, tlsPort, "/mobile-api/state");

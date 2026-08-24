@@ -5,8 +5,7 @@
 ## 信任边界
 
 - Harness、SSH 凭据和 `dsh-tool-ssh` 配置只存在电脑上；手机永远不获得 SSH 密钥。
-- 手机通过 HTTPS TLS 代理访问；代理只允许 `/mobile` 与 `/mobile-api`，Harness 仍只绑定回环地址。Android 客户端固定本机
-  DSH CA 与服务端 SAN；不要将其 Web 服务直接绑定到 `0.0.0.0`，也不要添加
+- 手机通过 HTTPS TLS 代理访问；代理只允许 `/mobile` 与 `/mobile-api`，Harness 仍只绑定回环地址。`/mobile-pair`、`/mobile-pair.json` 与 `/mobile-admin` 只接受 `localhost`、`127.0.0.1` 或 `::1`。Android 客户端固定二维码携带的当前叶证书 SHA-256 指纹，并继续校验证书有效期与服务端 SAN；不要将其 Web 服务直接绑定到 `0.0.0.0`，也不要添加
   `--trusted-host`。
 - 配对密钥只用于建立会话，随后请求依赖 HttpOnly Cookie。它不可被前端 JS 读取，也不会出现在查询参数、浏览器历史或 Service Worker 请求缓存中。
 - `/mobile-pair` 只接受电脑的回环 Host，二维码采用随机、单次有效且最长 15 分钟的
@@ -29,15 +28,16 @@
 ## 残余风险
 
 - 手机解锁且 Cookie 未过期时，持有手机的人可使用该 App；请使用系统锁屏，并在设置页执行“退出此设备”以撤销会话。
-- TLS 只在证书被手机信任时有效。证书警告、未受信任自签名证书或 HTTP 降级都不应被忽略。
+- TLS 只在证书指纹与配对二维码完全一致时有效。指纹变化、SAN 错误、过期证书或 HTTP 降级都会被拒绝；应刷新本机二维码并重新配对，而不是关闭校验。
 - `allowExistingSessions: true` 会扩大手机可见范围；仅在你确实需要控制桌面会话时启用。
+- 悬浮宠物、电脑凭据、文件管理及无关全局设置不进入手机状态或 API；“断开此设备”仅位于手机设置的危险操作区，并要求二次确认。
 - `allowUnrestrictedCommands: true` 的 SSH 别名等同于在对应远程账号权限内赋予手机任意 Shell；应继续使用低权限账号和服务器侧限制。
 - 插件不提供多用户身份、设备撤销列表、审计归属或公网暴露保护。若需多人/多设备，应重新设计为每设备配对密钥、角色、持久会话和完整审计的服务。
 
 ## 上线检查
 
 1. 用 `accessTokenEnv` 注入至少 32 字节随机密钥；不要设置 `allowInlineAccessToken: true`。
-2. 为手机实际访问的 IP/DNS 配置可信 TLS 证书，并使用 `scripts/lan-proxy.mjs`。
+2. 为手机实际访问的 IP/DNS 生成带正确 SAN 的 TLS 证书，并使用 `scripts/lan-proxy.mjs`；二维码必须携带该叶证书的 SHA-256 指纹。
 3. 保持 `allowExistingSessions: false`，仅将必要别名写入 `sshAliases`。
 4. 让 `dsh-tool-ssh` 保持主机指纹固定、精确命令白名单和低权限远程账号。
 5. 执行 `node test/smoke.mjs` 与 `npm audit --omit=dev` 后再安装或发布。

@@ -2,6 +2,7 @@
   "use strict";
   const key = "dsh_mobile_theme";
   const media = window.matchMedia("(prefers-color-scheme: dark)");
+  if (navigator.userAgent.includes("DSHMobileAndroid")) document.documentElement.classList.add("native-android");
 
   function storedPreference() {
     try {

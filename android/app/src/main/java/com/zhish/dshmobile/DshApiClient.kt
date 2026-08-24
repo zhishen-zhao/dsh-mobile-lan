@@ -1,44 +1,51 @@
 package com.zhish.dshmobile
 
 import android.content.Context
+import android.os.Build
 import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.InputStream
 import java.net.URI
 import java.net.URL
-import java.security.KeyStore
+import java.security.MessageDigest
 import java.security.SecureRandom
-import java.security.cert.CertificateFactory
+import java.security.cert.CertificateException
+import java.security.cert.X509Certificate
 import javax.net.ssl.HttpsURLConnection
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLSocketFactory
-import javax.net.ssl.TrustManagerFactory
+import javax.net.ssl.X509TrustManager
 
-data class PairedSession(val server: URI, val cookie: String, val expiresAt: Long)
+data class PairedSession(val server: URI, val cookie: String, val expiresAt: Long, val certificateSha256: String)
 
 private class ApiException(message: String) : Exception(message)
 
 /** Native networking only exchanges a one-time pairing code for a WebView cookie. */
 private class DshApiClient(context: Context) {
     private val appContext = context.applicationContext
-    private val dshSocketFactory: SSLSocketFactory by lazy(::createDshSocketFactory)
 
     fun connect(pairing: PairingUri): PairedSession {
-        val login = request("POST", pairing.server, "/mobile-api/login", JSONObject().put("token", pairing.token))
+        val login = request(
+            "POST",
+            pairing.server,
+            "/mobile-api/login",
+            JSONObject().put("token", pairing.token).put("deviceName", "${Build.MANUFACTURER} ${Build.MODEL}".trim().take(80)),
+            certificateSha256 = pairing.certificateSha256,
+        )
         val cookie = login.cookie ?: throw ApiException("服务器没有签发设备会话，请重新扫码。")
-        request("GET", pairing.server, "/mobile-api/state", cookie = cookie)
+        request("GET", pairing.server, "/mobile-api/state", cookie = cookie, certificateSha256 = pairing.certificateSha256)
         val expiresAt = login.json.optLong("expiresAt").takeIf { it > System.currentTimeMillis() }
             ?: (System.currentTimeMillis() + login.json.optLong("expiresInMs", 12 * 60 * 60 * 1000L))
-        return PairedSession(pairing.server, cookie, expiresAt)
+        return PairedSession(pairing.server, cookie, expiresAt, pairing.certificateSha256)
     }
 
     fun validate(session: PairedSession) {
-        request("GET", session.server, "/mobile-api/state", cookie = session.cookie)
+        request("GET", session.server, "/mobile-api/state", cookie = session.cookie, certificateSha256 = session.certificateSha256)
     }
 
     fun logout(session: PairedSession) {
         try {
-            request("POST", session.server, "/mobile-api/logout", JSONObject(), session.cookie)
+            request("POST", session.server, "/mobile-api/logout", JSONObject(), session.cookie, session.certificateSha256)
         } catch (_: Exception) {
             // Local credentials are discarded even when the computer is offline.
         }
@@ -52,11 +59,12 @@ private class DshApiClient(context: Context) {
         path: String,
         body: JSONObject? = null,
         cookie: String? = null,
+        certificateSha256: String,
     ): Response {
         val connection = (endpoint(server, path).openConnection() as? HttpsURLConnection)
             ?: throw ApiException("仅允许 HTTPS 连接")
         try {
-            connection.sslSocketFactory = dshSocketFactory
+            connection.sslSocketFactory = createPinnedSocketFactory(certificateSha256)
             connection.requestMethod = method
             connection.connectTimeout = 10_000
             connection.readTimeout = 30_000
@@ -84,7 +92,7 @@ private class DshApiClient(context: Context) {
         } catch (error: ApiException) {
             throw error
         } catch (_: Exception) {
-            throw ApiException("网络或 TLS 连接失败。请确认电脑在线、手机处于同一局域网，并信任本机证书。")
+            throw ApiException("网络或 TLS 连接失败。请确认电脑在线、手机处于同一局域网，并重新扫描当前二维码。")
         } finally {
             connection.disconnect()
         }
@@ -117,19 +125,22 @@ private class DshApiClient(context: Context) {
         }
     }
 
-    private fun createDshSocketFactory(): SSLSocketFactory {
-        val certificate = appContext.resources.openRawResource(R.raw.dsh_mobile_local_ca).use { input ->
-            CertificateFactory.getInstance("X.509").generateCertificate(input)
+    private fun createPinnedSocketFactory(certificateSha256: String): SSLSocketFactory {
+        val expected = certificateSha256.lowercase()
+        val trustManager = object : X509TrustManager {
+            override fun getAcceptedIssuers(): Array<X509Certificate> = emptyArray()
+            override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) = throw CertificateException("client certificates are not accepted")
+            override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {
+                val leaf = chain?.firstOrNull() ?: throw CertificateException("server certificate is missing")
+                leaf.checkValidity()
+                val actual = MessageDigest.getInstance("SHA-256").digest(leaf.encoded).joinToString("") { "%02x".format(it) }
+                if (!MessageDigest.isEqual(actual.toByteArray(Charsets.US_ASCII), expected.toByteArray(Charsets.US_ASCII))) {
+                    throw CertificateException("server certificate fingerprint changed")
+                }
+            }
         }
-        val keyStore = KeyStore.getInstance(KeyStore.getDefaultType()).apply {
-            load(null, null)
-            setCertificateEntry("dsh-mobile-local-ca", certificate)
-        }
-        val trustManagers = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm()).apply {
-            init(keyStore)
-        }.trustManagers
         return SSLContext.getInstance("TLS").apply {
-            init(null, trustManagers, SecureRandom())
+            init(null, arrayOf(trustManager), SecureRandom())
         }.socketFactory
     }
 

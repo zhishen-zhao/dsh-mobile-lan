@@ -37,6 +37,19 @@ let workingPhase = null;
 let workingTool = null;
 let workingTicker = null;
 let pendingDangerPreset = null;
+let pendingArchiveSessionId = null;
+let sessionQuery = "";
+let sessionSort = "updated-desc";
+let suppressSessionClickUntil = 0;
+let sessionSearchTimer = null;
+let sessionSearchGeneration = 0;
+let sessionSearchPending = false;
+let sessionSearchHasMore = false;
+let sessionSearchError = "";
+let sessionSearchComposing = false;
+const sessionSearchResults = new Map();
+let drawerSettleTimer = null;
+let nativeDisconnecting = false;
 let queueExpanded = false;
 let imageDrafts = [];
 let connection = { phase: "connecting", latencyMs: null, detail: "正在连接 Harness…" };
@@ -186,13 +199,25 @@ function logout() {
   state = null;
   controls = null;
   currentSessionId = null;
+  if (navigator.userAgent.includes("DSHMobileAndroid")) {
+    if (!nativeDisconnecting) {
+      nativeDisconnecting = true;
+      location.href = "dshmobile://disconnect";
+    }
+    return;
+  }
   $("app").classList.add("hidden");
   $("login").classList.remove("hidden");
 }
 
 async function logoutDevice() {
   try { await fetch("/mobile-api/logout", { method: "POST", headers: { "content-type": "application/json" }, body: "{}", credentials: "same-origin" }); } catch {}
-  if (navigator.userAgent.includes("DSHMobileAndroid")) location.href = "dshmobile://disconnect";
+  if (navigator.userAgent.includes("DSHMobileAndroid")) {
+    if (!nativeDisconnecting) {
+      nativeDisconnecting = true;
+      location.href = "dshmobile://disconnect";
+    }
+  }
   else logout();
 }
 
@@ -276,8 +301,104 @@ function relativeTime(value) {
   return `${Math.floor(hours / 24)}天`;
 }
 
-function appendSessionGroup(container, key, title, sessions, icon = "▱") {
-  if (sessions.length === 0) return;
+function openSessionActions(item) {
+  openSheet("会话操作", sessionLabel(item), (content) => {
+    content.appendChild(optionRow("重命名", "设置一个固定的会话名称", false, () => {
+      closeSheet();
+      openRenameSessionSheet(item);
+    }));
+    content.appendChild(optionRow("创建分支", "从此会话的最新完整状态创建新会话", false, () => {
+      closeSheet();
+      void forkWholeSession(item);
+    }));
+    const archive = optionRow("归档", "从普通分组中隐藏；Harness 仍保留会话记录", false, () => {
+      closeSheet();
+      openArchiveConfirmation(item);
+    });
+    archive.classList.add("danger-option");
+    content.appendChild(archive);
+  });
+}
+
+function openRenameSessionSheet(item) {
+  openSheet("重命名会话", sessionLabel(item), (content) => {
+    const form = document.createElement("form");
+    form.className = "rename-session-form";
+    const input = document.createElement("input");
+    input.type = "text";
+    input.maxLength = 120;
+    input.required = true;
+    input.value = sessionLabel(item);
+    input.setAttribute("aria-label", "新会话名称");
+    const submit = document.createElement("button");
+    submit.type = "submit";
+    submit.className = "primary full";
+    submit.textContent = "保存名称";
+    form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      const title = input.value.trim();
+      if (title.length === 0) return;
+      submit.disabled = true;
+      void renameSession(item.sessionId, title);
+    });
+    form.append(input, submit);
+    content.appendChild(form);
+    requestAnimationFrame(() => { input.focus(); input.select(); });
+  });
+}
+
+async function renameSession(sessionId, title) {
+  try {
+    await api("/rename-session", { method: "POST", body: { sessionId, title } });
+    closeSheet();
+    await refresh({ quiet: true });
+    toast("会话已重命名");
+  } catch (error) { toast(String(error.message ?? error)); }
+}
+
+async function forkWholeSession(item) {
+  try {
+    const result = await api("/fork", { method: "POST", body: { sessionId: item.sessionId } });
+    toast("已创建新的对话分支");
+    await refresh({ quiet: true });
+    await chooseSession(result.sessionId);
+  } catch (error) { toast(String(error.message ?? error)); }
+}
+
+function bindSessionLongPress(button, item) {
+  let timer = null;
+  let startX = 0;
+  let startY = 0;
+  let suppressClick = false;
+  const cancel = () => { if (timer !== null) clearTimeout(timer); timer = null; };
+  button.addEventListener("pointerdown", (event) => {
+    if (event.button !== 0) return;
+    startX = event.clientX;
+    startY = event.clientY;
+    cancel();
+    timer = setTimeout(() => {
+      timer = null;
+      suppressClick = true;
+      navigator.vibrate?.(18);
+      openSessionActions(item);
+    }, 550);
+  });
+  button.addEventListener("pointermove", (event) => {
+    if (Math.abs(event.clientX - startX) > 12 || Math.abs(event.clientY - startY) > 12) cancel();
+  });
+  for (const type of ["pointerup", "pointercancel", "pointerleave"]) button.addEventListener(type, () => {
+    cancel();
+    if (suppressClick) setTimeout(() => { suppressClick = false; }, 350);
+  });
+  button.addEventListener("contextmenu", (event) => { event.preventDefault(); openSessionActions(item); });
+  button.addEventListener("click", (event) => {
+    if (suppressClick || Date.now() < suppressSessionClickUntil) { event.preventDefault(); return; }
+    void chooseSession(item.sessionId);
+  });
+}
+
+function appendSessionGroup(container, key, title, sessions, icon = "▱", { showEmpty = false } = {}) {
+  if (sessions.length === 0 && !showEmpty) return;
   const section = document.createElement("section");
   section.className = "session-group";
   const heading = document.createElement("div");
@@ -289,7 +410,15 @@ function appendSessionGroup(container, key, title, sessions, icon = "▱") {
   label.textContent = title;
   heading.append(folder, label);
   section.appendChild(heading);
-  const expanded = expandedGroups.has(key);
+  if (sessions.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "session-group-empty";
+    empty.textContent = "此工作区暂无匹配会话";
+    section.appendChild(empty);
+    container.appendChild(section);
+    return;
+  }
+  const expanded = expandedGroups.has(key) || sessionQuery.length > 0;
   const visible = expanded ? sessions : sessions.slice(0, 5);
   for (const item of visible) {
     const button = document.createElement("button");
@@ -301,13 +430,23 @@ function appendSessionGroup(container, key, title, sessions, icon = "▱") {
       dot.className = "running-dot";
       button.appendChild(dot);
     }
+    const copy = document.createElement("span");
+    copy.className = "session-copy";
     const name = document.createElement("span");
     name.className = "session-name";
     name.textContent = sessionLabel(item);
+    copy.appendChild(name);
+    const snippetText = sessionSearchResults.get(item.sessionId);
+    if (sessionQuery.trim().length > 0 && typeof snippetText === "string" && snippetText.length > 0) {
+      const snippet = document.createElement("span");
+      snippet.className = "search-snippet";
+      snippet.textContent = snippetText;
+      copy.appendChild(snippet);
+    }
     const time = document.createElement("time");
     time.textContent = relativeTime(item.updatedAt);
-    button.append(name, time);
-    button.addEventListener("click", () => chooseSession(item.sessionId));
+    button.append(copy, time);
+    bindSessionLongPress(button, item);
     section.appendChild(button);
   }
   if (sessions.length > 5) {
@@ -324,24 +463,100 @@ function appendSessionGroup(container, key, title, sessions, icon = "▱") {
   container.appendChild(section);
 }
 
+function normalizedSearch(value) {
+  return String(value ?? "").normalize("NFKC").toLocaleLowerCase();
+}
+
+function workspaceMatchesSearch(workspace, query = normalizedSearch(sessionQuery.trim())) {
+  if (query.length === 0) return false;
+  const pathQuery = query.length >= 4 || /[\\/:]/.test(sessionQuery);
+  return [workspace?.title, ...(pathQuery ? [workspace?.path, workspace?.workspaceId] : [])].some((value) => normalizedSearch(value).includes(query));
+}
+
+function sortedVisibleSessions() {
+  const query = normalizedSearch(sessionQuery.trim());
+  const workspaces = new Map((state?.workspace?.options ?? []).map((item) => [item.workspaceId, item]));
+  const sessions = (state?.sessions ?? []).filter((item) => {
+    if (item.archived) return false;
+    if (query.length === 0) return true;
+    const workspace = workspaces.get(item.workspaceId);
+    const pathQuery = query.length >= 4 || /[\\/:]/.test(sessionQuery);
+    const localMatch = [sessionLabel(item), workspace?.title, ...(pathQuery ? [item.sessionId, item.cwd, workspace?.path, workspace?.workspaceId] : [])].some((value) => normalizedSearch(value).includes(query));
+    return localMatch || sessionSearchResults.has(item.sessionId);
+  });
+  return sessions.sort((a, b) => {
+    if (sessionSort === "updated-asc") return (a.updatedAt ?? 0) - (b.updatedAt ?? 0);
+    if (sessionSort === "title-asc") return sessionLabel(a).localeCompare(sessionLabel(b), "zh-CN", { numeric: true, sensitivity: "base" });
+    return (b.updatedAt ?? 0) - (a.updatedAt ?? 0);
+  });
+}
+
 function renderSessionGroups() {
   const container = $("session-groups");
   container.innerHTML = "";
-  const sessions = (state?.sessions ?? []).filter((item) => !item.archived).sort((a, b) => (b.updatedAt ?? 0) - (a.updatedAt ?? 0));
+  const sessions = sortedVisibleSessions();
   const assigned = new Set();
   for (const workspace of state?.workspace?.options ?? []) {
     const items = sessions.filter((item) => item.workspaceId === workspace.workspaceId);
     for (const item of items) assigned.add(item.sessionId);
-    appendSessionGroup(container, `workspace:${workspace.workspaceId}`, workspace.title, items, "▰");
+    appendSessionGroup(container, `workspace:${workspace.workspaceId}`, workspace.title, items, "▰", { showEmpty: workspaceMatchesSearch(workspace) });
   }
   appendSessionGroup(container, "ungrouped", "未分组", sessions.filter((item) => !assigned.has(item.sessionId)), "▱");
   if (container.childElementCount === 0) {
     const empty = document.createElement("p");
     empty.className = "muted";
     empty.style.padding = "14px 8px";
-    empty.textContent = "还没有会话";
+    empty.textContent = sessionQuery.length > 0 ? "没有匹配的会话" : "还没有会话";
     container.appendChild(empty);
   }
+  renderSessionSearchStatus(sessions);
+}
+
+function renderSessionSearchStatus(sessions = sortedVisibleSessions()) {
+  const status = $("session-search-status");
+  const query = sessionQuery.trim();
+  if (query.length === 0) { status.classList.add("hidden"); status.textContent = ""; return; }
+  status.classList.remove("hidden");
+  if (sessionSearchPending) { status.textContent = "正在搜索会话、消息内容和工作区…"; return; }
+  if (sessionSearchError.length > 0) { status.textContent = `消息内容搜索暂不可用；已显示名称和工作区结果。${sessionSearchError}`; return; }
+  const workspaceCount = (state?.workspace?.options ?? []).filter((item) => workspaceMatchesSearch(item)).length;
+  status.textContent = `找到 ${sessions.length} 个会话${workspaceCount > 0 ? ` · ${workspaceCount} 个工作区` : ""}${sessionSearchHasMore ? " · 消息结果仅显示前 20 项" : ""}`;
+}
+
+function queueSessionSearch(value) {
+  sessionQuery = value;
+  sessionSearchGeneration += 1;
+  const generation = sessionSearchGeneration;
+  if (sessionSearchTimer !== null) clearTimeout(sessionSearchTimer);
+  sessionSearchTimer = null;
+  sessionSearchResults.clear();
+  sessionSearchHasMore = false;
+  sessionSearchError = "";
+  sessionSearchPending = false;
+  renderSessionGroups();
+  const query = value.trim();
+  if (query.length === 0) return;
+  sessionSearchPending = true;
+  renderSessionSearchStatus();
+  sessionSearchTimer = setTimeout(async () => {
+    sessionSearchTimer = null;
+    try {
+      const result = await api("/search", { query: { query } });
+      if (generation !== sessionSearchGeneration) return;
+      sessionSearchResults.clear();
+      for (const item of result.items ?? []) sessionSearchResults.set(item.sessionId, item.snippet ?? "");
+      sessionSearchHasMore = result.hasMore === true;
+    } catch (error) {
+      if (generation !== sessionSearchGeneration) return;
+      const detail = String(error.message ?? error);
+      sessionSearchError = /search is disabled|SESSION_QUERY_SEARCH_DISABLED/i.test(detail) ? "当前 Harness 未启用消息内容索引。" : "请稍后重试。";
+    } finally {
+      if (generation === sessionSearchGeneration) {
+        sessionSearchPending = false;
+        renderSessionGroups();
+      }
+    }
+  }, 280);
 }
 
 function renderSessions(sessions) {
@@ -1668,6 +1883,45 @@ function closeDangerConfirmation() {
   $("confirm-layer").setAttribute("aria-hidden", "true");
 }
 
+function openDisconnectConfirmation() {
+  $("disconnect-layer").classList.remove("hidden");
+  $("disconnect-layer").setAttribute("aria-hidden", "false");
+}
+
+function closeDisconnectConfirmation() {
+  $("disconnect-layer").classList.add("hidden");
+  $("disconnect-layer").setAttribute("aria-hidden", "true");
+}
+
+function openArchiveConfirmation(item) {
+  pendingArchiveSessionId = item.sessionId;
+  $("archive-session-name").textContent = sessionLabel(item);
+  $("archive-layer").classList.remove("hidden");
+  $("archive-layer").setAttribute("aria-hidden", "false");
+}
+
+function closeArchiveConfirmation() {
+  pendingArchiveSessionId = null;
+  $("archive-layer").classList.add("hidden");
+  $("archive-layer").setAttribute("aria-hidden", "true");
+}
+
+async function archivePendingSession() {
+  const sessionId = pendingArchiveSessionId;
+  if (sessionId === null) return;
+  const wasCurrent = sessionId === currentSessionId;
+  closeArchiveConfirmation();
+  closeDrawer();
+  try {
+    await api("/archive-session", { method: "POST", body: { sessionId } });
+    await refresh({ quiet: true });
+    const visible = (state?.sessions ?? []).filter((item) => !item.archived);
+    if (visible.length === 0) await createSession();
+    else if (wasCurrent) await selectCurrentSession();
+    toast("会话已归档，原始记录仍保留");
+  } catch (error) { toast(String(error.message ?? error)); }
+}
+
 async function setPermission(preset) {
   if (currentSessionId === null) return;
   try {
@@ -2001,16 +2255,146 @@ async function runSsh() {
 }
 
 function openDrawer() {
+  if (drawerSettleTimer !== null) clearTimeout(drawerSettleTimer);
+  drawerSettleTimer = null;
   renderSessionGroups();
-  $("session-drawer").classList.add("open");
-  $("session-drawer").setAttribute("aria-hidden", "false");
-  $("drawer-scrim").classList.remove("hidden");
+  const drawer = $("session-drawer");
+  const scrim = $("drawer-scrim");
+  drawer.classList.remove("dragging");
+  drawer.classList.add("open");
+  drawer.style.removeProperty("transform");
+  drawer.setAttribute("aria-hidden", "false");
+  scrim.classList.remove("hidden", "dragging");
+  scrim.style.removeProperty("opacity");
 }
 
 function closeDrawer() {
-  $("session-drawer").classList.remove("open");
-  $("session-drawer").setAttribute("aria-hidden", "true");
-  $("drawer-scrim").classList.add("hidden");
+  if (drawerSettleTimer !== null) clearTimeout(drawerSettleTimer);
+  drawerSettleTimer = null;
+  closeSessionSortMenu();
+  const drawer = $("session-drawer");
+  const scrim = $("drawer-scrim");
+  drawer.classList.remove("open", "dragging");
+  drawer.style.removeProperty("transform");
+  drawer.setAttribute("aria-hidden", "true");
+  scrim.classList.remove("dragging");
+  scrim.style.removeProperty("opacity");
+  scrim.classList.add("hidden");
+}
+
+function renderSessionSortMenu() {
+  const labels = { "updated-desc": "最近更新", "updated-asc": "最早更新", "title-asc": "名称排序" };
+  $("session-sort-label").textContent = labels[sessionSort] ?? labels["updated-desc"];
+  for (const button of document.querySelectorAll("[data-session-sort]")) {
+    const selected = button.dataset.sessionSort === sessionSort;
+    button.setAttribute("aria-checked", String(selected));
+    button.querySelector(".sort-check").textContent = selected ? "✓" : "";
+  }
+}
+
+function openSessionSortMenu() {
+  renderSessionSortMenu();
+  $("session-sort-menu").classList.remove("hidden");
+  $("btn-session-sort").setAttribute("aria-expanded", "true");
+}
+
+function closeSessionSortMenu() {
+  $("session-sort-menu").classList.add("hidden");
+  $("btn-session-sort").setAttribute("aria-expanded", "false");
+}
+
+function installDrawerSwipe() {
+  const chat = $("chat-page");
+  const drawer = $("session-drawer");
+  const scrim = $("drawer-scrim");
+  drawer.addEventListener("click", (event) => {
+    if (Date.now() < suppressSessionClickUntil) { event.preventDefault(); event.stopImmediatePropagation(); }
+  }, true);
+  const showProgress = (progress) => {
+    const bounded = Math.max(0, Math.min(1, progress));
+    drawer.classList.add("dragging");
+    drawer.style.transform = `translateX(${(bounded - 1) * 105}%)`;
+    drawer.setAttribute("aria-hidden", String(bounded === 0));
+    scrim.classList.remove("hidden");
+    scrim.classList.add("dragging");
+    scrim.style.opacity = String(bounded);
+    return bounded;
+  };
+  const settle = (open) => {
+    if (drawerSettleTimer !== null) clearTimeout(drawerSettleTimer);
+    drawer.classList.toggle("open", open);
+    drawer.setAttribute("aria-hidden", String(!open));
+    drawer.classList.remove("dragging");
+    scrim.classList.remove("dragging");
+    if (open) scrim.classList.remove("hidden");
+    requestAnimationFrame(() => {
+      drawer.style.removeProperty("transform");
+      scrim.style.opacity = open ? "1" : "0";
+    });
+    drawerSettleTimer = setTimeout(() => {
+      drawerSettleTimer = null;
+      scrim.style.removeProperty("opacity");
+      if (!open && !drawer.classList.contains("open")) scrim.classList.add("hidden");
+    }, 200);
+  };
+  const install = (target, initiallyOpen, shouldIgnore) => {
+    let tracking = false;
+    let dragging = false;
+    let startX = 0;
+    let startY = 0;
+    let progress = initiallyOpen ? 1 : 0;
+    let velocityX = 0;
+    let lastX = 0;
+    let lastAt = 0;
+    target.addEventListener("touchstart", (event) => {
+      if (event.touches.length !== 1 || shouldIgnore(event)) return;
+      tracking = true;
+      dragging = false;
+      startX = event.touches[0].clientX;
+      startY = event.touches[0].clientY;
+      lastX = startX;
+      lastAt = performance.now();
+      velocityX = 0;
+      progress = initiallyOpen ? 1 : 0;
+    }, { passive: true });
+    target.addEventListener("touchmove", (event) => {
+      if (!tracking || event.touches.length !== 1) return;
+      const point = event.touches[0];
+      const deltaX = point.clientX - startX;
+      const deltaY = point.clientY - startY;
+      const direction = initiallyOpen ? -1 : 1;
+      if (!dragging) {
+        if (direction * deltaX < -12 || (Math.abs(deltaY) > 12 && Math.abs(deltaY) > Math.abs(deltaX))) { tracking = false; return; }
+        if (Math.abs(deltaX) < 8 || Math.abs(deltaX) <= Math.abs(deltaY) * 1.15) return;
+        dragging = true;
+        suppressSessionClickUntil = Date.now() + 600;
+        if (!initiallyOpen) renderSessionGroups();
+        closeSessionSortMenu();
+      }
+      const now = performance.now();
+      const elapsed = Math.max(1, now - lastAt);
+      velocityX = (point.clientX - lastX) / elapsed;
+      lastX = point.clientX;
+      lastAt = now;
+      progress = showProgress((initiallyOpen ? 1 : 0) + deltaX / Math.max(1, drawer.getBoundingClientRect().width));
+    }, { passive: true });
+    target.addEventListener("touchend", () => {
+      if (tracking && dragging) {
+        const shouldOpen = initiallyOpen ? !(progress < 0.72 || velocityX < -0.45) : progress > 0.28 || velocityX > 0.45;
+        settle(shouldOpen);
+        if (shouldOpen !== initiallyOpen) navigator.vibrate?.(12);
+      }
+      tracking = false;
+      dragging = false;
+    }, { passive: true });
+    target.addEventListener("touchcancel", () => {
+      if (tracking && dragging) settle(initiallyOpen);
+      tracking = false;
+      dragging = false;
+    }, { passive: true });
+  };
+  install(chat, false, (event) => drawer.classList.contains("open") || Boolean(event.target.closest("button, a, input, textarea, select, summary, details, pre, code, .composer")));
+  install(drawer, true, (event) => !drawer.classList.contains("open") || Boolean(event.target.closest("input, textarea, select")));
 }
 
 function switchPage(name) {
@@ -2018,7 +2402,23 @@ function switchPage(name) {
   closeDrawer();
 }
 
+function handleMobileBack() {
+  if (!$("archive-layer").classList.contains("hidden")) { closeArchiveConfirmation(); return true; }
+  if (!$("disconnect-layer").classList.contains("hidden")) { closeDisconnectConfirmation(); return true; }
+  if (!$("confirm-layer").classList.contains("hidden")) { closeDangerConfirmation(); return true; }
+  if (!$("sheet-layer").classList.contains("hidden")) { closeSheet(); return true; }
+  if (!$("command-menu").classList.contains("hidden")) { closeCommandMenu(); return true; }
+  if (!$("session-sort-menu").classList.contains("hidden")) { closeSessionSortMenu(); return true; }
+  if ($("session-drawer").classList.contains("open")) { closeDrawer(); return true; }
+  if (!$("settings-page").classList.contains("hidden") || !$("ssh-page").classList.contains("hidden")) {
+    switchPage("chat");
+    return true;
+  }
+  return false;
+}
+
 document.addEventListener("DOMContentLoaded", () => {
+  window.DSHMobileBack = handleMobileBack;
   $("composer-form").prepend($("image-draft"));
   $("btn-login").addEventListener("click", async () => { $("login-error").classList.add("hidden"); try { await tryLogin($("login-token").value); } catch (error) { $("login-error").textContent = String(error.message ?? error); $("login-error").classList.remove("hidden"); } });
   $("login-token").addEventListener("keydown", (event) => { if (event.key === "Enter") $("btn-login").click(); });
@@ -2028,8 +2428,17 @@ document.addEventListener("DOMContentLoaded", () => {
   $("btn-close-sidebar").addEventListener("click", closeDrawer);
   $("drawer-scrim").addEventListener("click", closeDrawer);
   $("btn-drawer-refresh").addEventListener("click", () => refresh());
-  $("btn-logout").addEventListener("click", logoutDevice);
-  $("btn-logout-settings").addEventListener("click", logoutDevice);
+  $("session-search").addEventListener("compositionstart", () => { sessionSearchComposing = true; });
+  $("session-search").addEventListener("compositionend", (event) => { sessionSearchComposing = false; queueSessionSearch(event.target.value); });
+  $("session-search").addEventListener("input", (event) => { if (!sessionSearchComposing) queueSessionSearch(event.target.value); });
+  $("btn-session-sort").addEventListener("click", () => $("session-sort-menu").classList.contains("hidden") ? openSessionSortMenu() : closeSessionSortMenu());
+  for (const button of document.querySelectorAll("[data-session-sort]")) button.addEventListener("click", () => {
+    sessionSort = button.dataset.sessionSort;
+    renderSessionSortMenu();
+    renderSessionGroups();
+    closeSessionSortMenu();
+  });
+  $("btn-logout-settings").addEventListener("click", openDisconnectConfirmation);
   $("btn-new-session").addEventListener("click", createSession);
   $("session-select").addEventListener("change", () => chooseSession($("session-select").value));
   $("composer-form").addEventListener("submit", (event) => { event.preventDefault(); void sendPrompt(); });
@@ -2042,6 +2451,7 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   $("input").addEventListener("input", syncComposer);
   document.addEventListener("click", (event) => {
+    if (!event.target.closest?.(".drawer-sort")) closeSessionSortMenu();
     const message = event.target.closest?.(".msg.has-message-actions") ?? null;
     if (message === null) closeMessageActions();
   });
@@ -2058,13 +2468,19 @@ document.addEventListener("DOMContentLoaded", () => {
   $("confirm-checkbox").addEventListener("change", () => { $("btn-confirm-danger").disabled = !$("confirm-checkbox").checked; });
   $("btn-confirm-cancel").addEventListener("click", closeDangerConfirmation);
   $("btn-confirm-danger").addEventListener("click", () => { const preset = pendingDangerPreset; closeDangerConfirmation(); if (preset) void setPermission(preset); });
+  $("btn-disconnect-cancel").addEventListener("click", closeDisconnectConfirmation);
+  $("btn-disconnect-confirm").addEventListener("click", () => { closeDisconnectConfirmation(); void logoutDevice(); });
+  $("btn-archive-cancel").addEventListener("click", closeArchiveConfirmation);
+  $("btn-archive-confirm").addEventListener("click", () => void archivePendingSession());
   $("btn-save-workspace").addEventListener("click", saveWorkspace);
   $("theme-select").addEventListener("change", () => { window.DSHTheme?.set?.($("theme-select").value); renderTheme(); });
   $("btn-ssh-run").addEventListener("click", runSsh);
   $("ssh-command").addEventListener("keydown", (event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") void runSsh(); });
   for (const button of document.querySelectorAll("[data-page]")) button.addEventListener("click", () => switchPage(button.dataset.page));
-  document.addEventListener("keydown", (event) => { if (event.key === "Escape") { closeDrawer(); closeSheet(); closeCommandMenu(); closeDangerConfirmation(); } });
+  document.addEventListener("keydown", (event) => { if (event.key === "Escape") { closeDrawer(); closeSheet(); closeCommandMenu(); closeSessionSortMenu(); closeDangerConfirmation(); closeDisconnectConfirmation(); closeArchiveConfirmation(); } });
   if ("serviceWorker" in navigator) navigator.serviceWorker.getRegistrations().then((items) => Promise.all(items.map((item) => item.unregister()))).catch(() => {});
+  installDrawerSwipe();
+  renderSessionSortMenu();
   renderTheme();
   void reconnect(true);
 });

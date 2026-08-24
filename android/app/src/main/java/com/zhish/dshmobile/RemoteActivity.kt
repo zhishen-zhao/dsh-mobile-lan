@@ -6,6 +6,7 @@ import android.content.Intent
 import android.content.pm.ApplicationInfo
 import android.graphics.Color
 import android.net.Uri
+import android.net.http.SslCertificate
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
@@ -31,6 +32,7 @@ import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.result.contract.ActivityResultContracts
+import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** The only post-pairing surface: a native View hierarchy hosting the audited PWA. */
@@ -69,10 +71,13 @@ class RemoteActivity : ComponentActivity() {
         configureWebView()
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                // Android's back gesture leaves the remote app without revoking
-                // its encrypted device session. Only the explicit in-page
-                // "断开此设备" action is allowed to clear pairing state.
-                moveTaskToBack(true)
+                if (!::webView.isInitialized) {
+                    moveTaskToBack(true)
+                    return
+                }
+                webView.evaluateJavascript("Boolean(window.DSHMobileBack && window.DSHMobileBack())") { handled ->
+                    if (handled != "true" && !closing.get()) moveTaskToBack(true)
+                }
             }
         })
         installSessionCookieAndLoad()
@@ -143,7 +148,7 @@ class RemoteActivity : ComponentActivity() {
             javaScriptCanOpenWindowsAutomatically = false
             mediaPlaybackRequiresUserGesture = true
             setGeolocationEnabled(false)
-            userAgentString = "$userAgentString DSHMobileAndroid/1.1"
+            userAgentString = "$userAgentString DSHMobileAndroid/1.8"
         }
         CookieManager.getInstance().setAcceptThirdPartyCookies(webView, false)
         webView.webChromeClient = object : WebChromeClient() {
@@ -279,8 +284,18 @@ class RemoteActivity : ComponentActivity() {
         }
 
         override fun onReceivedSslError(view: WebView, handler: SslErrorHandler, error: android.net.http.SslError) {
+            val current = session
+            val certificateBytes = SslCertificate.saveState(error.certificate).getByteArray("x509-certificate")
+            val actualPin = certificateBytes?.let { bytes ->
+                MessageDigest.getInstance("SHA-256").digest(bytes).joinToString("") { "%02x".format(it) }
+            }
+            if (current != null && error.primaryError == android.net.http.SslError.SSL_UNTRUSTED &&
+                actualPin.equals(current.certificateSha256, ignoreCase = true) && isAllowed(Uri.parse(error.url))) {
+                handler.proceed()
+                return
+            }
             handler.cancel()
-            showError("TLS 证书校验失败。请检查电脑 IP 与本机证书，不要改用 HTTP。")
+            showError("TLS 证书与配对二维码不一致。请在电脑设置页刷新二维码后重新配对。")
         }
 
         override fun onRenderProcessGone(view: WebView, detail: android.webkit.RenderProcessGoneDetail): Boolean {

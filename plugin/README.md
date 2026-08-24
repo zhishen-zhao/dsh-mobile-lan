@@ -45,9 +45,11 @@ $env:DSH_MOBILE_PAIRING_TOKEN = [Convert]::ToBase64String($bytes)
 
 Restart `dsh web` after changing configuration. The legacy inline `accessToken` is ignored unless `allowInlineAccessToken: true` is explicitly set for a short migration. `allowExistingSessions: true` exposes all Harness sessions to the paired device.
 
+When this plugin and the local settings provider are enabled, the `http://127.0.0.1:3080` Settings dialog adds a **Mobile** page in its left navigation beside **Desktop pet**. It persists the mobile title, retained-history count, session lifetime, and the option to select only already-configured workspaces. The same page renders a local-only one-time pairing QR and can refresh it without exposing the long-lived pairing secret. Before minting a QR it verifies that the advertised LAN TLS endpoint is listening; an offline proxy produces a `start-mobile-lan.ps1` recovery hint instead of an unusable QR. Pairing secrets, HTTPS origins, SSH aliases, and workspace scope remain deployment-only YAML settings.
+
 ## HTTPS phone access
 
-Keep `dsh web` on its default loopback binding. For a complete installation, use `.\scripts\start-mobile-lan.ps1` from the repository root. It starts Harness when needed, reuses the stable CA to issue a leaf certificate for the current physical LAN IPv4, restarts the proxy, and updates the endpoint file atomically. The manual equivalent is:
+Keep `dsh web` on its default loopback binding. For a complete Windows installation, use `.\scripts\install.ps1` from the repository root. It creates the environment secret, installs this bundle, registers per-user startup, and launches the address watcher. The watcher reuses a valid leaf certificate on the same address and records its SHA-256 fingerprint for app-specific QR pinning. The manual proxy equivalent is:
 
 ```powershell
 dsh web
@@ -62,7 +64,7 @@ HTTPS protects web traffic from reading and modification in transit, and service
 
 ## API
 
-`POST /mobile-api/login` accepts `{token}` and creates the cookie session. Authenticated endpoints include session state/history, queue editing and steering, message forks, multimodal prompts and scoped attachments, question/approval responses, permission/model/preset controls, SSH, SSE events, and logout. URL query tokens are not supported. Default scope permits only mobile-created sessions.
+`POST /mobile-api/login` accepts `{token}` and creates the cookie session. Authenticated endpoints include session state/history and scoped message-content search, durable rename/archive operations, queue editing and steering, anchored or whole-session forks, multimodal prompts and scoped attachments, question/approval responses, permission/model/preset controls, SSH, SSE events, and logout. Desktop credentials, file management, desktop-pet preferences, and unrelated global settings are never exposed to the phone. URL query tokens are not supported. Default scope permits only mobile-created sessions.
 
 ## Development
 
