@@ -12,7 +12,7 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import net from "node:net";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Context } from "@deepseek-ai/cordis";
@@ -24,6 +24,13 @@ const ok = (label) => {
 	passed += 1;
 	console.log(`  ok - ${label}`);
 };
+
+const monitorSource = readFileSync(new URL("../../scripts/start-mobile-lan.ps1", import.meta.url), "utf8");
+assert.match(monitorSource, /\[switch\]\$StartHarness/);
+assert.match(monitorSource, /\$manageHarness = \$StartHarness -and -not \$DoNotStartHarness/);
+assert.match(monitorSource, /if \(-not \$manageHarness\) \{/);
+assert.doesNotMatch(monitorSource, /if \(\$DoNotStartHarness\) \{ return \$null \}/);
+ok("LAN monitor leaves Harness stopped by default and requires explicit -StartHarness ownership");
 
 assert.equal(isAllowedProxyRequest("GET", "/mobile/"), true);
 assert.equal(isAllowedProxyRequest("GET", "/mobile/app.js?v=1"), true);

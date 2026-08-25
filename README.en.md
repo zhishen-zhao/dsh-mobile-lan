@@ -55,12 +55,12 @@ Read [the repository security policy](SECURITY.md), [the mobile plugin threat mo
 
 | Path | Purpose |
 | --- | --- |
-| `plugin/` | `dsh-mobile-remote` Cordis plugin, PWA, TLS proxy, and 56 smoke tests. |
+| `plugin/` | `dsh-mobile-remote` Cordis plugin, PWA, TLS proxy, and 57 smoke tests. |
 | `android/` | Android 1.8 QR launcher, certificate pinning, system image picker, and restricted WebView client. |
 | `optional/dsh-tool-ssh/` | Optional SSH tool and 21 loopback SSH tests. |
 | `docs/branding/` | App icon source, generated master, and launcher-mask preview. |
 | `scripts/setup-local-tls.ps1` | Creates the CA once, then reuses it while refreshing the current server identity. |
-| `scripts/start-mobile-lan.ps1` | Starts/monitors Harness and the TLS proxy and follows the physical LAN IPv4. |
+| `scripts/start-mobile-lan.ps1` | Monitors the TLS proxy and follows the physical LAN IPv4; it does not start or restart Harness by default. |
 | `scripts/install.ps1` | Guided Windows setup: creates the secret, installs the plugin, registers per-user logon startup, and starts monitoring. |
 | `scripts/generate-app-icons.py` | Regenerates the Android and PWA icon sets from the source artwork. |
 | `scripts/verify.ps1` | Runs the JavaScript, dependency, SSH, Android, and lint checks. |
@@ -84,9 +84,9 @@ cd dsh-mobile-lan
 .\scripts\install.ps1
 ```
 
-The installer creates and stores a high-entropy pairing secret, installs the local package through the official `dsh plugin --profile web add` command, registers the per-user `DSH Mobile LAN` logon task, and starts LAN monitoring. It never writes the pairing secret or private keys into the repository.
+The installer creates and stores a high-entropy pairing secret, installs the local package through the official `dsh plugin --profile web add` command, registers the per-user `DSH Mobile LAN` logon task, and replaces any older LAN monitor process with the current lifecycle policy. It never writes the pairing secret or private keys into the repository.
 
-Restart a currently running Harness **once** so it receives the environment secret and browser plugin. If another program owns the Harness lifecycle, use `./scripts/install.ps1 -DoNotStartHarness`. Allow Node.js through Windows Firewall only on trusted **private** networks.
+Restart a currently running Harness **once** so it receives the environment secret and browser plugin. The login monitor leaves the Harness lifecycle under user control by default: after `dsh web` is closed it waits instead of reopening it. Use `./scripts/install.ps1 -StartHarness` only when the monitor should own and restart Harness. Allow Node.js through Windows Firewall only on trusted **private** networks.
 
 ### 2. Install Android
 
@@ -111,7 +111,7 @@ The debug APK is `android/app/build/outputs/apk/debug/app-debug.apk`.
 
 ### Manual startup and advanced configuration
 
-Without the logon task, run `./scripts/start-mobile-lan.ps1`, or add `-DoNotStartHarness` when another process manages Harness. Defaults use `DSH_MOBILE_PAIRING_TOKEN` and `$HOME/.dsh/mobile-endpoint.json`; session scope, workspace allowlists, and SSH aliases remain optional profile overrides. Pairing secrets, TLS origins, and credentials are never editable from the phone.
+Without the logon task, run `./scripts/start-mobile-lan.ps1`. Add `-StartHarness` only to let the monitor start and restart Harness; the legacy `-DoNotStartHarness` switch remains accepted but is now equivalent to the default. Defaults use `DSH_MOBILE_PAIRING_TOKEN` and `$HOME/.dsh/mobile-endpoint.json`; session scope, workspace allowlists, and SSH aliases remain optional profile overrides. Pairing secrets, TLS origins, and credentials are never editable from the phone.
 
 ## Optional SSH support
 
@@ -170,7 +170,7 @@ $env:Path = "$env:JAVA_HOME\bin;$env:Path"
 
 Current verified baseline:
 
-- `dsh-mobile-remote 0.11.0`: 56 smoke checks covering 3080 Settings pairing and device management, TLS certificate pins, proxy readiness, Harness 0.1.1 image capability gating, turn-failure feedback, interaction responses, optimistic queue updates, session management, and message-content search.
+- `dsh-mobile-remote 0.11.0`: 57 smoke checks covering 3080 Settings pairing and device management, TLS certificate pins, proxy readiness, Harness lifecycle isolation, Harness 0.1.1 image capability gating, turn-failure feedback, interaction responses, optimistic queue updates, session management, and message-content search.
 - `dsh-tool-ssh 0.2.1`: 21 loopback SSH checks, compatible with `@deepseek-ai/dsh-* 0.1.1-rc.2`.
 - Production npm dependency audits: zero known vulnerabilities.
 - Android: `testDebugUnitTest`, `lintDebug`, and `assembleDebug` pass.

@@ -55,12 +55,12 @@ flowchart LR
 
 | 路径 | 内容 |
 | --- | --- |
-| `plugin/` | `dsh-mobile-remote` Cordis 插件、PWA、TLS 代理和 56 项 smoke 测试。 |
+| `plugin/` | `dsh-mobile-remote` Cordis 插件、PWA、TLS 代理和 57 项 smoke 测试。 |
 | `android/` | Android 1.8 原生扫码启动器、证书指纹绑定、系统图片选择器和受限 WebView。 |
 | `optional/dsh-tool-ssh/` | 可选 SSH 工具插件及 21 项回环 SSH 测试。 |
 | `docs/branding/` | App 图标源文件、生成结果与圆形/自适应遮罩预览。 |
 | `scripts/setup-local-tls.ps1` | 首次生成 CA；以后复用 CA，仅为当前地址重签服务证书。 |
-| `scripts/start-mobile-lan.ps1` | 启动/监控 Harness 和 TLS 代理，跟随物理局域网 IPv4。 |
+| `scripts/start-mobile-lan.ps1` | 监控 TLS 代理并跟随物理局域网 IPv4；默认不启动或重启 Harness。 |
 | `scripts/install.ps1` | Windows 引导安装：生成密钥、安装插件、注册用户登录任务并启动局域网监控。 |
 | `scripts/generate-app-icons.py` | 从图标源文件重新生成 Android 与 PWA 全套尺寸。 |
 | `scripts/verify.ps1` | 运行插件、SSH 和 Android 的完整验证。 |
@@ -84,12 +84,12 @@ cd dsh-mobile-lan
 .\scripts\install.ps1
 ```
 
-安装脚本会生成并保存高熵配对密钥、通过官方 `dsh plugin --profile web add` 安装本地插件、注册当前用户登录时自动运行的 `DSH Mobile LAN` 任务，并启动地址监控。它不会把密钥或证书私钥写入仓库。
+安装脚本会生成并保存高熵配对密钥、通过官方 `dsh plugin --profile web add` 安装本地插件、注册当前用户登录时自动运行的 `DSH Mobile LAN` 任务，并用当前生命周期策略替换旧的地址监控进程。它不会把密钥或证书私钥写入仓库。
 
-安装完成后，将正在运行的 Harness **重启一次**，使其读取新环境变量和浏览器插件。以后可直接运行 `dsh web`；登录任务会保持局域网 TLS 代理跟随当前物理 WLAN/以太网地址。若 Harness 由其他程序负责启动，可改用：
+安装完成后，将正在运行的 Harness **重启一次**，使其读取新环境变量和浏览器插件。以后可自行运行和关闭 `dsh web`；登录任务只保持局域网 TLS 代理跟随当前物理 WLAN/以太网地址，检测到 Harness 关闭时会等待，不会将它重新启动。只有明确希望脚本托管 Harness 生命周期时才使用：
 
 ```powershell
-.\scripts\install.ps1 -DoNotStartHarness
+.\scripts\install.ps1 -StartHarness
 ```
 
 Windows 防火墙询问时，只允许受信任的“专用网络”。
@@ -121,9 +121,11 @@ cd android
 
 ```powershell
 .\scripts\start-mobile-lan.ps1
-# Harness 已由其他程序管理：
-.\scripts\start-mobile-lan.ps1 -DoNotStartHarness
+# 可选：同时托管并在异常退出后重启 Harness：
+.\scripts\start-mobile-lan.ps1 -StartHarness
 ```
+
+`-DoNotStartHarness` 仍作为旧版本兼容参数保留，但现在与默认行为相同。
 
 默认配置已使用 `DSH_MOBILE_PAIRING_TOKEN` 和 `$HOME/.dsh/mobile-endpoint.json`。会话范围、工作区、SSH 别名等高级设置仍可通过 `$DSH_HOME/profiles/web/cordis.patch.yml` 覆盖；配对密钥、TLS 地址和凭据不会开放给手机修改。
 
@@ -190,7 +192,7 @@ $env:Path = "$env:JAVA_HOME\bin;$env:Path"
 
 当前基线：
 
-- `dsh-mobile-remote 0.11.0`：56 项 smoke 测试；包含 3080 设置页配对与设备管理、TLS 证书指纹、代理就绪检查、Harness 0.1.1 图片能力门控、运行失败提示、交互回包、队列乐观更新、会话管理和消息内容搜索。
+- `dsh-mobile-remote 0.11.0`：57 项 smoke 测试；包含 3080 设置页配对与设备管理、TLS 证书指纹、代理就绪检查、Harness 生命周期隔离、Harness 0.1.1 图片能力门控、运行失败提示、交互回包、队列乐观更新、会话管理和消息内容搜索。
 - `dsh-tool-ssh 0.2.1`：21 项回环 SSH 测试，兼容 `@deepseek-ai/dsh-* 0.1.1-rc.2`。
 - 两个 npm 生产依赖审计：0 个已知漏洞。
 - Android：`testDebugUnitTest`、`lintDebug`、`assembleDebug`。

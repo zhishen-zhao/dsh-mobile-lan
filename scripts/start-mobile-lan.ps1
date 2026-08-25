@@ -11,11 +11,19 @@ param(
 
     [string]$EndpointFile = (Join-Path ([Environment]::GetFolderPath('UserProfile')) '.dsh\mobile-endpoint.json'),
 
+    [switch]$StartHarness,
+
+    # Deprecated compatibility switch. Harness is no longer started by default.
     [switch]$DoNotStartHarness
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+
+if ($StartHarness -and $DoNotStartHarness) {
+    throw 'StartHarness and DoNotStartHarness cannot be used together.'
+}
+$manageHarness = $StartHarness -and -not $DoNotStartHarness
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $tlsScript = Join-Path $PSScriptRoot 'setup-local-tls.ps1'
@@ -97,7 +105,7 @@ function Test-ReusableServerCertificate {
 
 function Start-HarnessProcess {
     if (Test-TcpPort -Address '127.0.0.1' -Port $TargetPort) { return $null }
-    if ($DoNotStartHarness) { return $null }
+    if (-not $manageHarness) { return $null }
 
     $dshCommand = Get-Command dsh -ErrorAction Stop
     $dshExecutable = $dshCommand.Source
@@ -165,9 +173,9 @@ try {
     Write-Host 'Watching the primary physical LAN adapter. Press Ctrl+C to stop.' -ForegroundColor Green
     while ($true) {
         if (-not (Test-TcpPort -Address '127.0.0.1' -Port $TargetPort)) {
-            if ($DoNotStartHarness) {
+            if (-not $manageHarness) {
                 if (-not $harnessUnavailableNotified) {
-                    Write-Warning "Harness is not listening on 127.0.0.1:$TargetPort; keeping the LAN monitor alive and waiting."
+                    Write-Warning "Harness is not listening on 127.0.0.1:$TargetPort; the LAN monitor will wait without starting or restarting dsh web."
                     $harnessUnavailableNotified = $true
                 }
                 Start-Sleep -Seconds $PollSeconds
